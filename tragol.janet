@@ -1,6 +1,6 @@
 # program main at $0800 is
 # result: byte;
-# proc test (A: byte, B: byte) returns (C: byte) is
+# proc test (A: byte, B: byte) returns (C: byte) at $1000 is
 # begin
 # set C = A + B;
 # end proc;
@@ -12,6 +12,7 @@
            :at 0x800
            :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
            :procs @[@{:kind :proc
+                      :at 0x1000
                       :name "test"
                       :args @[@{:kind :var :name "A" :type :byte}
                               @{:kind :var :name "B" :type :byte}]
@@ -22,12 +23,14 @@
                                 :rvalue @{:kind :binop
                                           :op :add
                                           :lhs @{:kind :ident :value "A"}
-                                          :rhs @{:kind :ident :value "B"}}}]}]
+                                          :rhs @{:kind :ident :value "B"}}}
+                              @{:kind :return}]}]
            :body @[@{:kind :call
-                     :target "test"
+                     :target @{:kind :ident :value "test"}
                      :args   @[@{:kind :num :value 34}
                                @{:kind :num :value 35}]
-                     :into   @[@{:kind :ident :value "result"}]}]})
+                     :into   @[@{:kind :ident :value "result"}]}
+                   @{:kind :return}]})
 
 (def call-graph @{})
 
@@ -36,6 +39,13 @@
 (defn lookup [name scope]
   (or (get (scope :names) name)
       (when (scope :parent) (lookup name (scope :parent)))))
+
+(defn resolve [ident scope]
+  (def name (ident :value))
+  (def decl (lookup name scope))
+  (unless decl (errorf "Unknown name `%s`" name))
+  (put ident :decl decl)
+  decl)
 
 (defn declare [decl scope]
   (def name (decl :name))
@@ -73,16 +83,16 @@
                lt (annotate-expr (stmt :lvalue) scope)]
            (unless (= lt rt) (errorf "Cannot assign %V to %V" rt lt)))
     :call (let [target (stmt :target)
-                callee (lookup (stmt :target) scope)]
-            (unless callee (errorf "Unknown name `%s`" target))
-            (unless (= (callee :kind) :proc) (errorf "`%s` is not a procedure" target))
-            (unless (= (length (stmt :args)) (length (callee :args))) (errorf "arity error in call to `%s`" target))
-            (unless (= (length (stmt :into)) (length (callee :returns))) (errorf "arity error in call to `%s`" target))
+                callee (resolve target scope)]
+            (unless (= (callee :kind) :proc) (errorf "`%s` is not a procedure" (target :value)))
+            (unless (= (length (stmt :args)) (length (callee :args))) (errorf "arity error in call to `%s`" (target :value)))
+            (unless (= (length (stmt :into)) (length (callee :returns))) (errorf "arity error in call to `%s`" (target :value)))
             (each arg (stmt :args) (annotate-expr arg scope))
             (each arg (stmt :into) (annotate-expr arg scope))
             (put (call-graph caller) (callee :name) true)
             (put stmt :callee callee))
-    (errorf "Unknown statement kind %V" (stmt :kind))))
+    :return ()
+    (errorf "Unknown statement `%V`" (stmt :kind))))
 
 (defn annotate-proc [proc parent]
   (assert (= (proc :kind) :proc))
@@ -142,16 +152,56 @@
 (defn allocate-program [prog]
   (put prog :label (prog :name))
   (each d (prog :globals) (alloc! d (d :name)))
-  # (each d (prog :globals) (alloc! d (string (prog :name) "_" (d :name))))
   (each p (prog :procs)
-    # (each d (p :args)    (alloc! d (string (prog :name) "_" (p :name) "_" (d :name))))
-    # (each d (p :returns) (alloc! d (string (prog :name) "_" (p :name) "_" (d :name))))
-    # (each d (p :locals)  (alloc! d (string (prog :name) "_" (p :name) "_" (d :name))))
+    (put p :label (p :name))
     (each d (p :args)    (alloc! d (string (p :name) "_" (d :name))))
-    (each d (p :returns) (alloc! d (string (prog :name) "_" (p :name) "_" (d :name))))
+    (each d (p :returns) (alloc! d (string (p :name) "_" (d :name))))
     (each d (p :locals)  (alloc! d (string (p :name) "_" (d :name))))))
 
 (defn gen [out & items] (array/push out items))
+
+(defn trivial? [expr]
+  (or (= (expr :kind) :num) (= (expr :kind) :ident)))
+
+(defn decl-operand [decl]
+  [:abs (decl :label)])
+
+(defn operand [expr]
+  (case (expr :kind)
+    :num [:imm (expr :value)]
+    :ident (decl-operand (expr :decl))
+    (errorf "`%q` is not a trivial expression" (expr :kind))))
+
+(defn gen-store [dst oprnd]
+  (gen dst :sta ;oprnd))
+
+(defn gen-add [dst operands] (gen dst :clc :imp) (gen dst :adc ;operands))
+(defn gen-sub [dst operands] (gen dst :sec :imp) (gen dst :sbc ;operands))
+
+(def binops
+  {:add {:gen gen-add :commutative true}
+   :sub {:gen gen-sub :commutative false}})
+
+(defn codegen-expr [dst expr]
+  (cond
+    (trivial? expr)
+    (gen dst :lda ;(operand expr))
+    
+    (= (expr :kind) :binop)
+    (let [op  (binops (expr :op))
+          lhs (expr :lhs)
+          rhs (expr :rhs)]
+      (cond
+        (trivial? rhs)
+        (do (codegen-expr dst lhs)
+            ((op :gen) dst (operand rhs)))
+
+        (and (op :commutative) (trivial? lhs))
+        (do (codegen-expr dst rhs) # swap sides
+            ((op :gen) dst (operand lhs)))
+        
+        (errorf "Expression too complex; split it into two statements pls")))
+   (errorf "Cannot generate expression `%q`" (expr :kind))))
 
 (defn codegen-var [d equates vars]
   (cond
@@ -160,38 +210,27 @@
     (gen vars :res (d :label) (d :size))))
 
 (defn codegen-label [dst node]
-  (gen :label (node :label)))
-
-(defn trivial? [e]
-  (or (= (e :kind) :num)
-      (= (e :kind) :ident)))
-
-(defn operand [e]
-  (case (e :kind)
-    :num [:imm (e :value)]
-    :ident [:abs ((e :decl) :label)]
-    (errorf "Not a trivial operand: `%V`" (e :kind))))
-
-(defn emit-leaf [out e]
-  (emit out :lda ;(operand e)))
-
-(def emitters {:num emit-leaf :ident emit-leaf :binop emit-binop})
-
-(defn emit-expr [out e]
-  (if-let [f (emitters (e :kind))]
-    (f out e)
-    (errorf "Cannot generate expression %q" (e :kind))))
-
-(defn store [out lv]
-  (emit out :sta ;(operand lv))) # ';' unpacks a tuple
+  (gen dst :label (node :label)))
 
 (defn codegen-stmt [dst stmt]
   (case (stmt :kind)
     :set (do (codegen-expr dst (stmt :rvalue))
-             (store dst (s :lvalue)))
-    (errorf "Can't generate statement `%V`" (stmt :kind))))
+             (gen-store dst (operand (stmt :lvalue))))
+    :call
+    (let [callee (get-in stmt [:target :decl])]
+      (for i 0 (length (stmt :args))
+        (codegen-expr dst ((stmt :args) i))
+        (gen-store dst (decl-operand ((callee :args) i))))
+      (gen dst :jsr :abs (callee :label))
+      (for i 0 (length (stmt :into))
+        (gen dst :lda ;(decl-operand ((callee :returns) i)))
+        (gen-store dst (operand ((stmt :into) i)))))
+
+    :return (gen dst :rts :imp)
+    (errorf "Cannot generate statement `%V`" (stmt :kind))))
 
 (defn codegen-proc [dst proc]
+  (when-let [at (proc :at)] (gen dst :org at))
   (codegen-label dst proc)
   (each s (proc :body) (codegen-stmt dst s)))
 
@@ -210,13 +249,31 @@
     (codegen-proc (if (p :at) fixed_procs procs) p))
 
   (when-let [at (prog :at)] (gen main :org at)) # * = at
-  (gen main :label "start")
+  (gen main :label (prog :label))
   (each s (prog :body) (codegen-stmt main s))
-  (gen main :rts))
+  (array/concat @[] equates main procs vars fixed_procs))
 
+(def modes
+  {:imp  (fn [mnemonic _]     (string "    " mnemonic))
+   :imm  (fn [mnemonic value] (string "    " mnemonic " #" ;value))
+   :abs  (fn [mnemonic value] (string "    " mnemonic " " ;value))
+   :absx (fn [mnemonic value] (string "    " mnemonic " " ;value ",x"))
+   :absy (fn [mnemonic value] (string "    " mnemonic " " ;value ",y"))
+   :indy (fn [mnemonic value] (string "    " mnemonic " (" ;value "),y"))})
+
+(defn emit-item [code]
+  (match code
+    [:org addr]       (printf "* = $%04x" addr)
+    [:label labl]     (print labl)
+    [:equ labl value] (printf "%s = $%x" labl value)
+    [:res labl size]  (printf "%s .fill %d" labl size) 
+    [mnemonic mode & value] (print ((modes mode) mnemonic value))
+    (errorf "Malformed code `%q`" code)))
+
+(pp ast)
 (annotate-program ast) # side-effect: call-graph
 (check-cycles call-graph)
 (allocate-program ast)
-(pp ast)
-(codegen-program ast)
-# (pp ast)
+(def code (codegen-program ast))
+(pp code)
+(each item code (emit-item item))
