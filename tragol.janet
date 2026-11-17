@@ -23,11 +23,13 @@
                      :into   @[@{:kind :ident :value "result"}]}
                    @{:kind :return}]})
 
-(defn fits-in-type? [value dst-type]
-  (case dst-type
-    :byte (<= value 255)
-    :address (<= value 65535)
-    (errorf "Invalid type `%V`" dst-type)))
+(def type-info
+  {:byte    {:fits? (fn [v] (<= v 255))
+             :size 1}
+   :address {:fits? (fn [v] (<= v 65535))
+             :size 2}})
+
+# ------------- TYPE CHECKING & ANNOTATION ------------- #
 
 (defn assignable? [expr]
   (case (expr :kind)
@@ -56,7 +58,7 @@
 (defn declare-all [scope decls]
   (each decl decls (declare scope decl)))
 
-(defn infer-expr [scope expr]
+(defn infer-expr-type [scope expr]
   (case (expr :kind)
     :ident
     (let [name (expr :value)
@@ -73,40 +75,42 @@
     (errorf "Cannot infer type of number literal `%q`" (expr :value))
     
     :binop
-    (let [lhs-type (infer-expr scope (expr :lhs))
-          rhs-type (infer-expr scope (expr :rhs))]
+    (let [lhs-type (infer-expr-type scope (expr :lhs))
+          rhs-type (infer-expr-type scope (expr :rhs))]
       (unless (= lhs-type rhs-type)
         (errorf "Type missmatch in `%q`: %V vs %V" expr lhs-type rhs-type))
       (put expr :type lhs-type)
-      lhs-type)))
+      lhs-type)
+    
+    (errorf "Cannot infer type of expression `%q`" expr)))
 
-(var expect-binop nil)
+(var expect-binop-type nil)
 
-(defn expect-expr [scope expr expected-type]
+(defn expect-expr-type [scope expr expected-type]
   (case (expr :kind)
     :ident
-    (let [actual-type (infer-expr scope expr)]
+    (let [actual-type (infer-expr-type scope expr)]
       (unless (= expected-type actual-type)
         (errorf "Type missmatch for `%s`: expected %V, got %V" (expr :value) expected-type actual-type))
       actual-type)
     
     :num
     (do
-      (unless (fits-in-type? (expr :value) expected-type)
+      (unless (((type-info expected-type) :fits?) (expr :value))
         (errorf "Value %d doesn't fit in type %V" (expr :value) expected-type))
       (put expr :type expected-type)
       expected-type)
     
     :binop
-    (expect-binop scope expr expected-type)))
+    (expect-binop-type scope expr expected-type)))
 
-(set expect-binop 
+(set expect-binop-type 
      (fn [scope expr expected-type]
        (case (expr :op)
          :add
          (do
-           (expect-expr scope (expr :lhs) expected-type)
-           (expect-expr scope (expr :rhs) expected-type)
+           (expect-expr-type scope (expr :lhs) expected-type)
+           (expect-expr-type scope (expr :rhs) expected-type)
            (put expr :type expected-type)
            expected-type))))
 
@@ -114,11 +118,11 @@
   (unless (= (length expected) (length got))
     (errorf "%s arity error in call to `%s`" what name)))
 
-(defn expect-lvalue [scope expr expected-type]
+(defn expect-lvalue-type [scope expr expected-type]
   (unless (assignable? expr)
     (errorf "Expression `%q` is not a valid lvalue" expr))
   
-  (let [actual-type (infer-expr scope expr)]
+  (let [actual-type (infer-expr-type scope expr)]
     (unless (= actual-type expected-type)
       (errorf "Expected lvalue of type %V, got %V"
               expected-type actual-type))))
@@ -126,10 +130,10 @@
 (defn annotate-stmt [scope stmt]
   (case (stmt :kind)
     :set (let [lvalue (stmt :lvalue)
-               ltype (infer-expr scope (stmt :lvalue))]
+               ltype (infer-expr-type scope (stmt :lvalue))]
            (unless (assignable? lvalue)
              (errorf "Expression `%q` is not a valid lvalue" lvalue))
-           (expect-expr scope (stmt :rvalue) ltype))
+           (expect-expr-type scope (stmt :rvalue) ltype))
     :call (let [target (stmt :target)
                 callee (resolve scope target)]
             (unless (= (callee :kind) :proc)
@@ -141,12 +145,12 @@
             (for i 0 (length (stmt :args))
               (let [arg ((stmt :args) i)
                     expected-type (((callee :args) i) :type)]
-                (expect-expr scope arg expected-type)))
+                (expect-expr-type scope arg expected-type)))
 
             (for i 0 (length (stmt :into))
               (let [dst ((stmt :into) i)
                     expected-type (((callee :returns) i) :type)]
-                (expect-lvalue scope dst expected-type))))
+                (expect-lvalue-type scope dst expected-type))))
     :return ()
     (errorf "Unknown statement `%V`" (stmt :kind))))
 
@@ -168,6 +172,31 @@
   (declare-all scope (prog :globals))
   (each proc (prog :procs) (declare scope proc))
   (each proc (prog :procs) (annotate-proc scope proc))
-  (each stmt (prog :body)  (annotate-stmt scope stmt)))
+  (each stmt (prog :body)  (annotate-stmt scope stmt))
+  prog)
 
-(annotate-program ast)
+# ------------- LABELING AND ADDRESSING (if neccessary) ------------- #
+
+(defn allocate-decl [decl labl]
+  (put decl :label labl)
+  (put decl :size ((type-info (decl :type)) :size))
+  (cond
+    (decl :at) nil
+    (= (decl :type) :address) (put decl :zp true)
+    nil))
+
+(defn allocate-proc [proc]
+  (assert (= (proc :kind) :proc))
+  (put proc :label (proc :name)) 
+  (each decl (proc :args)    (allocate-decl decl (string (proc :name) "_" (decl :name))))
+  (each decl (proc :returns) (allocate-decl decl (string (proc :name) "_" (decl :name))))
+  (each decl (proc :locals)  (allocate-decl decl (string (proc :name) "_" (decl :name)))))
+
+(defn allocate-program [prog]
+  (assert (= (prog :kind) :program))
+  (each decl (prog :globals) (allocate-decl decl (decl :name)))
+  (each proc (prog :procs)
+    (allocate-proc proc))
+  prog)
+
+(pp (allocate-program (annotate-program ast)))
