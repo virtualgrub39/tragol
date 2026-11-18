@@ -1,4 +1,4 @@
-program main is
+program main at $0800 is
     result: byte at $fe;
 
     proc test (foo: byte; bar: byte) returns (baz: byte) is
@@ -6,6 +6,24 @@ program main is
         set baz = foo + bar - 33;
         return;
     end proc;
+
+    proc awoooga (poopoo: byte) returns (peepee: byte) is
+        weewee: byte;
+    begin
+        set weewee = poopoo - 10;
+        set peepee = weewee + poopoo - 69;
+        return;
+    end proc;
+
+    proc boob is
+        xyz: byte;
+        zyx: byte;
+    begin
+        call test (11, 22) into (xyz);
+        call awoooga (xyz) into (zyx); 
+    end proc;
 begin
     call test (34, 35) into (result);
+    call awoooga (result) into (result);
+    return;
 end program;

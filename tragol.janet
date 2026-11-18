@@ -354,29 +354,130 @@
   (each stmt (prog :body)  (annotate-stmt scope stmt))
   prog)
 
-# ------------- LABELING AND ADDRESSING (if neccessary) ------------- #
+# ------------- CALL GRAPH ------------- #
 
-(defn allocate-decl [decl labl]
-  (put decl :label labl)
-  (put decl :size ((type-info (decl :type)) :size))
-  (cond
-    (decl :at) nil
-    (= (decl :type) :address) (put decl :zp true)
-    nil))
+(def main-node "<main>")
 
-(defn allocate-proc [proc]
-  (assert (= (proc :kind) :proc))
-  (put proc :label (proc :name))
-  (each decl (proc :args)    (allocate-decl decl (string (proc :name) "_" (decl :name))))
-  (each decl (proc :returns) (allocate-decl decl (string (proc :name) "_" (decl :name))))
-  (each decl (proc :locals)  (allocate-decl decl (string (proc :name) "_" (decl :name)))))
+(defn build-call-graph [prog]
+  (def graph @{})
+  (defn ensure [n] (unless (graph n) (put graph n @[])))
+  
+  (ensure main-node)
+  (each proc (prog :procs) (ensure (proc :name)))
+  
+  (defn scan-body [from body]
+    (each stmt body
+      (when (= (stmt :kind) :call)
+        (def callee (get-in stmt [:target :decl :name]))
+        (array/push (graph from) callee))))
+  
+  (scan-body main-node (prog :body))
+  (each proc (prog :procs)
+    (scan-body (proc :name) (proc :body)))
+  
+  graph)
+
+(defn check-cycles [graph]
+  (def state @{})                       # nil => unvisited, :on-stack, :done
+
+  (defn visit [node path]
+    (case (get state node)
+      :done     nil
+      :on-stack
+      (let [start (find |(= $ node) path)
+            cycle (array/slice path start)]
+        (errorf "Recursion is forbidden: %s"
+                (string/join (map string cycle) " -> ")))
+      (do
+        (put state node :on-stack)
+        (array/push path node)
+        (each callee (graph node) (visit callee path))
+        (array/pop path)
+        (put state node :done))))
+
+  (each node (sorted (keys graph))
+    (visit node @[])))
+
+(defn compute-depths [graph root]
+  (def callers @{})
+  (each from (keys graph)
+    (each callee (graph from)
+      (unless (get callers callee) (put callers callee @[]))
+      (array/push (callers callee) from)))
+
+  (def depths @{})
+  (each node (keys graph) (put depths node 0))
+
+  (var changed true)
+  (while changed
+    (set changed false)
+    (each node (keys graph)
+      (each caller (get callers node @[])
+        (def candidate (+ 1 (depths caller)))
+        (when (> candidate (depths node))
+          (put depths node candidate)
+          (set changed true)))))
+
+  depths)
+
+# ------------- LABELING AND ADDRESSING ------------- #
+
+(defn proc-all-vars [proc]
+  (array/concat @[] (proc :args) (proc :returns) (proc :locals)))
+
+(defn proc-frame-size [proc]
+  (var n 0)
+  (each decl (proc-all-vars proc)
+    (unless (decl :at)
+      (+= n ((type-info (decl :type)) :size))))
+  n)
+
+(defn assign-proc-labels [proc depth]
+  (var off 0)
+  (each decl (proc-all-vars proc)
+    (put decl :size ((type-info (decl :type)) :size))
+    (if (decl :at)
+      (put decl :label (string (proc :name) "_" (decl :name)))
+      (do
+        (put decl :label (string "frame_" depth "+" off))
+        (+= off ((type-info (decl :type)) :size))))))
+
+(defn allocate-shared-frames [prog]
+  (def graph (build-call-graph prog))
+  (check-cycles graph)
+  (def depths (compute-depths graph main-node))
+  
+  (def procs-by-depth @{})
+  (each proc (prog :procs)
+    (def depth (depths (proc :name)))
+    (unless (get procs-by-depth depth) (put procs-by-depth depth @[]))
+    (array/push (procs-by-depth depth) proc))
+  
+  (each depth (keys procs-by-depth)
+    (each proc (procs-by-depth depth)
+      (assign-proc-labels proc depth)))
+  
+  (def frames @[])
+  (each depth (sorted (keys procs-by-depth))
+    (var max-size 0)
+    (each proc (procs-by-depth depth)
+      (set max-size (max max-size (proc-frame-size proc))))
+    (when (> max-size 0)
+      (array/push frames @{:label (string "frame_" depth)
+                           :size  max-size})))
+  frames)
 
 (defn allocate-program [prog]
-  (assert (= (prog :kind) :program))
   (put prog :label (prog :name))
-  (each decl (prog :globals) (allocate-decl decl (decl :name)))
+
   (each proc (prog :procs)
-    (allocate-proc proc))
+    (put proc :label (proc :name)))
+
+  (each decl (prog :globals)
+    (put decl :label (decl :name))
+    (put decl :size ((type-info (decl :type)) :size)))
+
+  (put prog :frames (allocate-shared-frames prog))
   prog)
 
 # ------------- CODEGEN ------------- #
@@ -494,22 +595,27 @@
   (def vars        @[]) # variables: label .fill size  
   (def fixed-procs @[]) # `proc` with `at` 
 
-  (each decl (prog :globals)   (codegen-decl equates vars decl))
+  (each decl (prog :globals)
+    (if (decl :at)
+      (codegen equates [:equ (decl :label) (decl :at)])
+      (codegen vars    [:res (decl :label) (decl :size)]))) 
+  
   (each proc (prog :procs)
-    (each decl (proc :args)    (codegen-decl equates vars decl))
-    (each decl (proc :returns) (codegen-decl equates vars decl))
-    (each decl (proc :locals)  (codegen-decl equates vars decl))
+    (each decl (proc-all-vars proc)
+      (when (decl :at)
+        (codegen equates [:equ (decl :label) (decl :at)]))))
+  
+  (each frame (prog :frames)
+    (codegen vars [:res (frame :label) (frame :size)]))
+  
+  (each proc (prog :procs)
     (codegen-proc (if (proc :at) fixed-procs procs) proc))
 
   (when-let [at (prog :at)] (codegen main-body [:org at]))
   (codegen main-body [:label (prog :label)])
   (each stmt (prog :body) (codegen-stmt main-body stmt))
-  (array/concat @[]
-                equates
-                main-body
-                procs
-                vars
-                fixed-procs))
+
+  (array/concat @[] equates main-body procs vars fixed-procs))
 
 # ------------- ASSEMBLY GENERATION (backend) ------------- #
 
@@ -545,10 +651,11 @@ end program;
 `)
 
 (defn main [& args]
-  (when (= (length args) 1)
+  (when (< (length args) 2)
     (errorf "Usage: %s src-path" (args 0)))
   (def src (slurp (args 1)))
-  (each item (codegen-program (allocate-program (annotate-program (parse-program (lex src)))))
+  (def program (annotate-program (parse-program (lex src))))
+  (each item (codegen-program (allocate-program program))
     (emit-item item)))
 
 # program main at $0800 is
