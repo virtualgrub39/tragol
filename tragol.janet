@@ -210,22 +210,92 @@
     (allocate-proc proc))
   prog)
 
-(pp (allocate-program (annotate-program ast)))
-
 # ------------- CODEGEN ------------- #
 
 # [:org at] -> * = at
 # [:label lbl] -> lbl
-# [:lda ;operand] -> lda operand
-# [:rts :imp] -> rst
-# 
+# [:equ label at] -> label = at
+# [:zp label size] -> label = <allocated address>
+# [:res label size] -> label .fill size
+# [instr :imp] -> instr
+# [instr :imm val] -> instr #val
+# [instr :abs val] -> instr val
+
+(defn trivial? [expr]
+  (case (expr :kind)
+    :num true
+    :ident true
+    false))
+
+(defn codegen [out instr] (array/concat out instr))
+
+(defn codegen-decl [equates vars decl]
+  (cond
+    (decl :at) (codegen equates [:equ (decl :label) (decl :at)])
+    (decl :zp) (codegen equates [:zp (decl :label) (decl :size)])
+    (codegen vars [:res (decl :label) (decl :size)])))
+
+(defn decl-operand [decl]
+  [:abs (decl :label)])
+
+(defn operand [expr]
+  (case (expr :kind)
+    :num [:imm (expr :value)]
+    :ident (decl-operand (expr :decl))
+    (errorf "`%q` is not a trivial expression" (expr :kind))))
+
+(defn codegen-label [out node]
+  (codegen out [:label (node :label)]))
+
+(defn codegen-store [dst oprnd]
+  (codegen dst [:sta ;oprnd]))
+
+(defn codegen-add [out operands] 
+  (codegen out [:clc :imp])
+  (codegen out [:adc ;operands]))
+
+(defn codegen-sub [out operands]
+  (codegen out [:sec :imp])
+  (codegen out [:sbc ;operands]))
+
+(def binops
+  {:add {:gen codegen-add :commutative true}
+   :sub {:gen codegen-sub :commutative false}})
+
+(var codegen-expr nil)
+
+(defn codegen-expr-binop [out expr]
+  (def op (binops (expr :op)))
+  (def lhs (expr :lhs))
+  (def rhs (expr :rhs))
+  
+  (cond
+    (trivial? rhs)
+    (do (codegen-expr out lhs) # ex. (b * c) + a
+        ((op :gen) out (operand rhs)))
+    
+    (and (op :commutative) (trivial? lhs)) # ex. a + (b * c)
+    (do (codegen-expr out rhs) # swap sides
+        ((op :gen) out (operand lhs)))
+    
+    (errorf "Expression too complex; split it into two statements pls")))
+
+(set codegen-expr (fn [out expr]
+  (cond
+    (trivial? expr)
+    (codegen out [:lda ;(operand expr)])
+
+    (= (expr :kind) :binop)
+    (codegen-expr-binop out expr)
+    
+    (errorf "Cannot generate expression `%q`" (expr :kind)))))
 
 (defn codegen-stmt-return [out stmt] (codegen out [:rts :imp]))
 
 (defn codegen-stmt-call [out stmt]
   (def callee (get-in stmt [:target :decl]))
   (for i 0 (length (stmt :args))
-    (codegen-expr out ((stmt :args) :i))
+    (codegen-expr out ((stmt :args) i))
     (codegen-store out (decl-operand ((callee :args) i))))
   (for i 0 (length (stmt :into))
     (codegen out [:lda ;(decl-operand ((callee :returns) i))])
@@ -270,3 +340,5 @@
                 procs
                 vars
                 fixed-procs))
+
+(pp (codegen-program (allocate-program (annotate-program ast))))
