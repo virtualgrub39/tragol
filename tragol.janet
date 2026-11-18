@@ -1,167 +1,414 @@
-# program main at $0800 is
-# result: byte;
-# proc test (A: byte, B: byte) returns (C: byte) at $1000 is
-# begin
-# set C = A + B;
-# end proc;
-# begin
-# call test (34, 35) into result;
-# end program;
-(def ast @{:kind :program
-           :name "main"
-           :at 0x800
-           :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
-           :procs @[@{:kind :proc
-                      :at 0x1000
-                      :name "test"
-                      :args @[@{:kind :var :name "A" :type :byte}
-                              @{:kind :var :name "B" :type :byte}]
-                      :locals @[]
-                      :returns @[@{:kind :var :name "C" :type :byte}]
-                      :body @[@{:kind :set
-                                :lvalue @{:kind :ident :value "C"}
-                                :rvalue @{:kind :binop
-                                          :op :add
-                                          :lhs @{:kind :ident :value "A"}
-                                          :rhs @{:kind :ident :value "B"}}}
-                              @{:kind :return}]}]
-           :body @[@{:kind :call
-                     :target @{:kind :ident :value "test"}
-                     :args   @[@{:kind :num :value 34}
-                               @{:kind :num :value 35}]
-                     :into   @[@{:kind :ident :value "result"}]}
-                   @{:kind :return}]})
+# ------------- LEXING ------------- #
 
-(def call-graph @{})
+(def- trivial-toks
+  {":"   :colon      ";"   :semicolon   "," :comma
+   "="   :equals     "("   :left-paren  ")" :right-paren
+   "\\/" :logical-or "/\\" :logical-and "[" :left-bracket
+   "]"   :right-bracket "+" :plus "-" :minus "?=" :compare
+   "(+)" :logical-xor})
+
+(def- keywords
+  {"proc"    :kw-proc    "is"     :kw-is
+   "begin"   :kw-begin   "end"    :kw-end
+   "set"     :kw-set     "returns" :kw-returns
+   "byte"    :kw-byte    "address" :kw-address
+   "program" :kw-program "at"     :kw-at
+   "into"    :kw-into    "call"   :kw-call
+   "return"  :kw-return})
+
+(def- punct-strings (sort-by |(- (length $)) (keys trivial-toks)))
+
+(def- lexer
+  (peg/compile
+   ~{:ws (+ (set " \t\r\n") (* "--" (any (if-not "\n" 1))))
+     :punct  (/ (capture (choice ,;punct-strings))
+                ,(fn [s] [(trivial-toks s)]))
+     :word   (/ (capture (* (+ :a "_") (any (+ :w "_"))))
+                ,(fn [w] (if-let [kw (keywords w)] [kw] [:ident w])))
+     :number (/ (capture (* (some :d) (not :w)))
+                ,(fn [n] [:num (scan-number n)]))
+     :hex (/ (capture (* "$" (some :h) (not :w)))
+             ,(fn [s] [:num (scan-number (string "0x" (string/slice s 1)))]))
+     :token (/ (* ($) (+ :punct :word :hex :number)) ,(fn [p [k v]] [k v p]))
+     :main   (* (any (* (any :ws) :token)) (any :ws) ($))}))
+
+(defn lex [src]
+  (def toks (peg/match lexer src))
+  (def pos (array/pop toks))
+  (if (< pos (length src))
+    (errorf "Syntax error near %q" (string/slice src pos (min (length src) (+ pos 10))))
+    (array/push toks [:eof])))
+
+# ------------- PARSING ------------- #
+
+(var- pos 0)
+(var- toks nil)
+
+(defn- peek [] (get toks pos))
+(defn- kind [] (get (peek) 0))
+(defn- at? [tag] (= (kind) tag))
+(defn- next! [] (def t (toks pos)) (unless (at? :eof) (++ pos)) t)
+(defn- accept [k] (when (at? k) (next!)))
+(defn- expect [k]
+  (if (at? k)
+    (next!)
+    (errorf "expected %v, got %v at offset %d" k (kind) ((toks pos) 2))))
+(defn- expect-name [] ((expect :ident) 1))
+(defn- expect-num [] ((expect :num) 1))
+
+(defn expect-type []
+  (def type-name (expect-name))
+  (case type-name
+    "byte" :byte
+    "address" :address
+    (errorf "Expected type name, got `%s`" type-name)))
+
+(defn- fail [what]
+  (errorf "expected %s, got %v at offset %v" what (kind) ((toks pos) 2)))
+
+(defn- expect-name [] ((expect :ident) 1))
+(defn- expect-num  [] ((expect :num) 1))
+(defn- expect-type []
+  (case (kind)
+    :kw-byte    (do (next!) :byte)
+    :kw-address (do (next!) :address)
+    (fail "type")))
+
+# '(' item (sep item)* ')'
+(defn- parse-list [item sep]
+  (expect :left-paren)
+  (def items @[])
+  (unless (at? :right-paren)
+    (array/push items (item))
+    (while (accept sep)
+      (array/push items (item))))
+  (expect :right-paren)
+  items)
+
+(defn- parse-typed-name []
+  (def name (expect-name))
+  (expect :colon)
+  (def typ (expect-type))
+  @{:kind :var :name name :type typ})
+
+(defn- parse-var-decl []
+  (def v (parse-typed-name))
+  (when (accept :kw-at) (put v :at (expect-num)))
+  (expect :semicolon)
+  v)
+
+(defn- parse-var-decls []            # for proc locals
+  (def out @[])
+  (while (not (at? :kw-begin))
+    (array/push out (parse-var-decl)))
+  out)
+
+(def- binary-ops
+  {:logical-or  {:bp 10 :op :or}   # weakest 
+   :logical-xor {:bp 15 :op :xor}
+   :logical-and {:bp 20 :op :and}
+   :plus        {:bp 40 :op :add}
+   :minus       {:bp 40 :op :sub}}) # strongest
+
+(defn- parse-ident []
+  @{:kind :ident :value (expect-name)})
+
+(defn parse-expr [&opt min-bp]
+  (default min-bp 0)
+  (var lhs
+       (case (kind)
+         :num        (let [t (next!)] @{:kind :num :value (t 1)})
+         :ident      (parse-ident)
+         :left-paren (do (next!)
+                         (def e (parse-expr 0))
+                         (expect :right-paren)
+                         e)
+         (fail "expression")))
+  (forever
+    (def info (binary-ops (kind)))
+    (when (or (nil? info) (< (info :bp) min-bp)) (break))
+    (next!)
+    (def rhs (parse-expr (+ (info :bp) 1)))
+    (set lhs @{:kind :binop :op (info :op) :lhs lhs :rhs rhs}))
+  lhs)
+
+(defn- parse-stmt-set []
+  (expect :kw-set)
+  (def lvalue (parse-ident))
+  (expect :equals)
+  (def rvalue (parse-expr))
+  (expect :semicolon)
+  @{:kind :set :lvalue lvalue :rvalue rvalue})
+
+(defn- parse-stmt-return []
+  (expect :kw-return)
+  (expect :semicolon)
+  @{:kind :return})
+
+(defn- parse-stmt-call []
+  (expect :kw-call)
+  (def target (parse-ident))
+  (def args (parse-list parse-expr :comma))
+  (def into (if (accept :kw-into) (parse-list parse-ident :comma) @[]))
+  (expect :semicolon)
+  @{:kind :call :target target :args args :into into})
+
+(defn- parse-stmts []
+  (def stmts @[])
+  (while (not (at? :kw-end))
+    (array/push stmts
+                (case (kind)
+                  :kw-set    (parse-stmt-set)
+                  :kw-return (parse-stmt-return)
+                  :kw-call   (parse-stmt-call)
+                  (fail "statement"))))
+  stmts)
+
+(defn- parse-proc []
+  (expect :kw-proc)
+  (def name (expect-name))
+  (def args (if (at? :left-paren)
+              (parse-list parse-typed-name :semicolon) @[]))
+  (def returns (if (accept :kw-returns)
+                 (parse-list parse-typed-name :semicolon) @[]))
+  (def addr (when (accept :kw-at) (expect-num)))
+  (expect :kw-is)
+  (def locals (parse-var-decls))
+  (expect :kw-begin)
+  (def body (parse-stmts))
+  (expect :kw-end)
+  (expect :kw-proc)
+  (expect :semicolon)
+  @{:kind :proc :name name :at addr :args args
+    :locals locals :returns returns :body body})
+
+(defn- parse-decls []                # program level: vars and procs mixed
+  (def globals @[])
+  (def procs @[])
+  (while (not (at? :kw-begin))
+    (if (at? :kw-proc)
+      (array/push procs (parse-proc))
+      (array/push globals (parse-var-decl))))
+  [globals procs])
+
+(defn parse-program [tokens]
+  (set toks tokens)
+  (set pos 0)
+  (expect :kw-program)
+  (def name (expect-name))
+  (def addr (when (accept :kw-at) (expect-num)))
+  (expect :kw-is)
+  (def [globals procs] (parse-decls))
+  (expect :kw-begin)
+  (def body (parse-stmts))
+  (expect :kw-end)
+  (expect :kw-program)
+  (expect :semicolon)
+  (expect :eof)
+  @{:kind :program :name name :at addr
+    :globals globals :procs procs :body body})
+
+(def type-info
+  {:byte    {:fits? (fn [v] (<= v 255))
+             :size 1}
+   :address {:fits? (fn [v] (<= v 65535))
+             :size 2}})
+
+# ------------- TYPE CHECKING & ANNOTATION ------------- #
+
+(defn assignable? [expr]
+  (case (expr :kind)
+    :ident true
+    false))
 
 (defn new-scope [parent] @{:names @{} :parent parent})
 
-(defn lookup [name scope]
+(defn lookup [scope name]
   (or (get (scope :names) name)
-      (when (scope :parent) (lookup name (scope :parent)))))
+      (when (scope :parent) (lookup (scope :parent) name))))
 
-(defn resolve [ident scope]
+(defn resolve [scope ident]
   (def name (ident :value))
-  (def decl (lookup name scope))
-  (unless decl (errorf "Unknown name `%s`" name))
+  (def decl (lookup scope name))
+  (unless decl (errorf "Undeclared symbol `%s`" name))
   (put ident :decl decl)
   decl)
 
-(defn declare [decl scope]
+(defn declare [scope decl]
   (def name (decl :name))
-  (when (lookup name scope)
-    (errorf "Redefinition of `%s`" name))
+  (when (lookup scope name)
+    (errorf "Redeclaration of symbol `%s`" name))
   (put (scope :names) name decl))
 
-(defn declare-all [decls scope storage]
-  (each d decls
-    (put d :storage storage)
-    (declare d scope)))
+(defn declare-all [scope decls]
+  (each decl decls (declare scope decl)))
 
-(defn annotate-expr [expr scope]
+(defn infer-expr-type [scope expr]
   (case (expr :kind)
-    :ident (let [name (expr :value)
-                 d    (lookup name scope)]
-             (unless d (errorf "Unknown name `%s`" name))
-             (unless (= (d :kind) :var) (errorf "`%s` is not a variable" name))
-             (put expr :decl d)
-             (put expr :type (d :type)))
-    :binop (let [l (annotate-expr (expr :lhs) scope)
-                 r (annotate-expr (expr :rhs) scope)]
-             (unless (= l r) (errorf "Type mismatch: %q vs %q" l r))
-             (put expr :type l))
-    :num   (let [v (expr :value)]
-             (if (< v 256)
-               (put expr :type :byte)
-               (put expr :type :address)))
-    (errorf "Unknown expression type `%V`" (expr :kind)))
-  (expr :type))
+    :ident
+    (let [name (expr :value)
+          decl (lookup scope name)]
+      (unless decl
+        (errorf "Name `%s` was not declared" name))
+      (unless (= (decl :kind) :var)
+        (errorf "Tried to use `%s` as a variable" name))
+      (put expr :decl decl)
+      (put expr :type (decl :type))
+      (decl :type))
 
-(defn annotate-stmt [stmt caller scope]
+    :num
+    (errorf "Cannot infer type of number literal `%q`" (expr :value))
+
+    :binop
+    (let [lhs-type (infer-expr-type scope (expr :lhs))
+          rhs-type (infer-expr-type scope (expr :rhs))]
+      (unless (= lhs-type rhs-type)
+        (errorf "Type missmatch in `%q`: %V vs %V" expr lhs-type rhs-type))
+      (put expr :type lhs-type)
+      lhs-type)
+
+    (errorf "Cannot infer type of expression `%q`" expr)))
+
+(var expect-binop-type nil)
+
+(defn expect-expr-type [scope expr expected-type]
+  (case (expr :kind)
+    :ident
+    (let [actual-type (infer-expr-type scope expr)]
+      (unless (= expected-type actual-type)
+        (errorf "Type missmatch for `%s`: expected %V, got %V" (expr :value) expected-type actual-type))
+      actual-type)
+
+    :num
+    (do
+      (unless (((type-info expected-type) :fits?) (expr :value))
+        (errorf "Value %d doesn't fit in type %V" (expr :value) expected-type))
+      (put expr :type expected-type)
+      expected-type)
+
+    :binop
+    (expect-binop-type scope expr expected-type)))
+
+(set expect-binop-type
+     (fn [scope expr expected-type]
+       (case (expr :op)
+         :add
+         (do
+           (expect-expr-type scope (expr :lhs) expected-type)
+           (expect-expr-type scope (expr :rhs) expected-type)
+           (put expr :type expected-type)
+           expected-type))))
+
+(defn verify-arity [what name expected got]
+  (unless (= (length expected) (length got))
+    (errorf "%s arity error in call to `%s`" what name)))
+
+(defn expect-lvalue-type [scope expr expected-type]
+  (unless (assignable? expr)
+    (errorf "Expression `%q` is not a valid lvalue" expr))
+
+  (let [actual-type (infer-expr-type scope expr)]
+    (unless (= actual-type expected-type)
+      (errorf "Expected lvalue of type %V, got %V"
+              expected-type actual-type))))
+
+(defn annotate-stmt [scope stmt]
   (case (stmt :kind)
-    :set (let [rt (annotate-expr (stmt :rvalue) scope)
-               lt (annotate-expr (stmt :lvalue) scope)]
-           (unless (= lt rt) (errorf "Cannot assign %V to %V" rt lt)))
+    :set (let [lvalue (stmt :lvalue)
+               ltype (infer-expr-type scope (stmt :lvalue))]
+           (unless (assignable? lvalue)
+             (errorf "Expression `%q` is not a valid lvalue" lvalue))
+           (expect-expr-type scope (stmt :rvalue) ltype))
     :call (let [target (stmt :target)
-                callee (resolve target scope)]
-            (unless (= (callee :kind) :proc) (errorf "`%s` is not a procedure" (target :value)))
-            (unless (= (length (stmt :args)) (length (callee :args))) (errorf "arity error in call to `%s`" (target :value)))
-            (unless (= (length (stmt :into)) (length (callee :returns))) (errorf "arity error in call to `%s`" (target :value)))
-            (each arg (stmt :args) (annotate-expr arg scope))
-            (each arg (stmt :into) (annotate-expr arg scope))
-            (put (call-graph caller) (callee :name) true)
-            (put stmt :callee callee))
+                callee (resolve scope target)]
+            (unless (= (callee :kind) :proc)
+              (errorf "`%q` is not a procedure" target))
+
+            (verify-arity "argument" (target :name) (callee :args) (stmt :args))
+            (verify-arity "return" (target :name) (callee :returns) (stmt :into))
+
+            (for i 0 (length (stmt :args))
+              (let [arg ((stmt :args) i)
+                    expected-type (((callee :args) i) :type)]
+                (expect-expr-type scope arg expected-type)))
+
+            (for i 0 (length (stmt :into))
+              (let [dst ((stmt :into) i)
+                    expected-type (((callee :returns) i) :type)]
+                (expect-lvalue-type scope dst expected-type))))
     :return ()
     (errorf "Unknown statement `%V`" (stmt :kind))))
 
-(defn annotate-proc [proc parent]
+(defn annotate-proc [parent proc]
   (assert (= (proc :kind) :proc))
 
   (def scope (new-scope parent))
-  (def name (proc :name))
-  (put call-graph name @{})
 
-  (declare-all (proc :args)    scope :param)
-  (declare-all (proc :locals)  scope :local)
-  (declare-all (proc :returns) scope :result)
-  (each stmt (proc :body) (annotate-stmt stmt name scope)))
+  (declare-all scope (proc :args))
+  (declare-all scope (proc :locals))
+  (declare-all scope (proc :returns))
+  (each stmt (proc :body) (annotate-stmt scope stmt)))
 
-(defn annotate-program [prog] # adds type information to expressions, does some basic type checking
+(defn annotate-program [prog]
   (assert (= (prog :kind) :program))
 
   (def scope (new-scope nil))
-  (put call-graph "<main>" @{})
 
-  (declare-all (prog :globals) scope :global)
-  (each proc (prog :procs) (declare proc scope))
-  (each proc (prog :procs) (annotate-proc proc scope))
-  (each stmt (prog :body) (annotate-stmt stmt "<main>" scope)))
+  (declare-all scope (prog :globals))
+  (each proc (prog :procs) (declare scope proc))
+  (each proc (prog :procs) (annotate-proc scope proc))
+  (each stmt (prog :body)  (annotate-stmt scope stmt))
+  prog)
 
-(defn check-cycles [graph]
-  (def state @{})              # nil = unvisited, :active = on current path, :done
-  (def path @[])
-  (def order @[])              # callees before callers
-  (defn visit [n]
-    (case (state n)
-      :done nil
-      :active (errorf "Recursion: %s"
-                      (string/join [;(slice path (index-of n path)) n] " -> "))
-      (do (put state n :active)
-          (array/push path n)
-          (each c (keys (graph n)) (visit c))
-          (array/pop path)
-          (put state n :done)
-          (array/push order n))))
-  (each n (keys graph) (visit n))
-  order)
+# ------------- LABELING AND ADDRESSING (if neccessary) ------------- #
 
-(defn type-size [t]
-  (case t
-    :byte 1
-    :address 2
-    (errorf "No size for type %q" t)))
-
-(defn alloc! [decl labl]
+(defn allocate-decl [decl labl]
   (put decl :label labl)
-  (put decl :size (type-size (decl :type)))
+  (put decl :size ((type-info (decl :type)) :size))
   (cond
-    (decl :at) nil                                   # equate emitted from :at
-    (= (decl :type) :address) (put decl :zp true)    # assembler places it in the ZP block
-    nil))                                            # plain RAM: nothing to decide
+    (decl :at) nil
+    (= (decl :type) :address) (put decl :zp true)
+    nil))
+
+(defn allocate-proc [proc]
+  (assert (= (proc :kind) :proc))
+  (put proc :label (proc :name))
+  (each decl (proc :args)    (allocate-decl decl (string (proc :name) "_" (decl :name))))
+  (each decl (proc :returns) (allocate-decl decl (string (proc :name) "_" (decl :name))))
+  (each decl (proc :locals)  (allocate-decl decl (string (proc :name) "_" (decl :name)))))
 
 (defn allocate-program [prog]
+  (assert (= (prog :kind) :program))
   (put prog :label (prog :name))
-  (each d (prog :globals) (alloc! d (d :name)))
-  (each p (prog :procs)
-    (put p :label (p :name))
-    (each d (p :args)    (alloc! d (string (p :name) "_" (d :name))))
-    (each d (p :returns) (alloc! d (string (p :name) "_" (d :name))))
-    (each d (p :locals)  (alloc! d (string (p :name) "_" (d :name))))))
+  (each decl (prog :globals) (allocate-decl decl (decl :name)))
+  (each proc (prog :procs)
+    (allocate-proc proc))
+  prog)
 
-(defn gen [out & items] (array/push out items))
+# ------------- CODEGEN ------------- #
+
+# [:org at] -> * = at
+# [:label lbl] -> lbl
+# [:equ label at] -> label = at
+# [:zp label size] -> label = <allocated address>
+# [:res label size] -> label .fill size
+# [instr :imp] -> instr
+# [instr :imm val] -> instr #val
+# [instr :abs val] -> instr val
 
 (defn trivial? [expr]
-  (or (= (expr :kind) :num) (= (expr :kind) :ident)))
+  (case (expr :kind)
+    :num true
+    :ident true
+    false))
+
+(defn codegen [out & instr] (array/concat out instr))
+
+(defn codegen-decl [equates vars decl]
+  (cond
+    (decl :at) (codegen equates [:equ (decl :label) (decl :at)])
+    (decl :zp) (codegen equates [:zp (decl :label) (decl :size)])
+    (codegen vars [:res (decl :label) (decl :size)])))
 
 (defn decl-operand [decl]
   [:abs (decl :label)])
@@ -172,108 +419,170 @@
     :ident (decl-operand (expr :decl))
     (errorf "`%q` is not a trivial expression" (expr :kind))))
 
-(defn gen-store [dst oprnd]
-  (gen dst :sta ;oprnd))
+(defn codegen-label [out node]
+  (codegen out [:label (node :label)]))
 
-(defn gen-add [dst operands] (gen dst :clc :imp) (gen dst :adc ;operands))
-(defn gen-sub [dst operands] (gen dst :sec :imp) (gen dst :sbc ;operands))
+(defn codegen-store [dst oprnd]
+  (codegen dst [:sta ;oprnd]))
+
+(defn codegen-add [out operands]
+  (codegen out [:clc :imp])
+  (codegen out [:adc ;operands]))
+
+(defn codegen-sub [out operands]
+  (codegen out [:sec :imp])
+  (codegen out [:sbc ;operands]))
 
 (def binops
-  {:add {:gen gen-add :commutative true}
-   :sub {:gen gen-sub :commutative false}})
+  {:add {:gen codegen-add :commutative true}
+   :sub {:gen codegen-sub :commutative false}})
 
-(defn codegen-expr [dst expr]
+(var codegen-expr nil)
+
+(defn codegen-expr-binop [out expr]
+  (def op (binops (expr :op)))
+  (def lhs (expr :lhs))
+  (def rhs (expr :rhs))
+
   (cond
-    (trivial? expr)
-    (gen dst :lda ;(operand expr))
-    
-    (= (expr :kind) :binop)
-    (let [op  (binops (expr :op))
-          lhs (expr :lhs)
-          rhs (expr :rhs)]
-      (cond
-        (trivial? rhs)
-        (do (codegen-expr dst lhs)
-            ((op :gen) dst (operand rhs)))
+    (trivial? rhs)
+    (do (codegen-expr out lhs) # ex. (b * c) + a
+        ((op :gen) out (operand rhs)))
 
-        (and (op :commutative) (trivial? lhs))
-        (do (codegen-expr dst rhs) # swap sides
-            ((op :gen) dst (operand lhs)))
-        
-        (errorf "Expression too complex; split it into two statements pls")))
-   (errorf "Cannot generate expression `%q`" (expr :kind))))
+    (and (op :commutative) (trivial? lhs)) # ex. a + (b * c)
+    (do (codegen-expr out rhs) # swap sides
+        ((op :gen) out (operand lhs)))
 
-(defn codegen-var [d equates vars]
-  (cond
-    (d :at) (gen equates :equ (d :label) (d :at))
-    (d :zp) (gen equates :zp (d :label) (d :size))
-    (gen vars :res (d :label) (d :size))))
+    (errorf "Expression too complex; split it into two statements pls")))
 
-(defn codegen-label [dst node]
-  (gen dst :label (node :label)))
+(set codegen-expr (fn [out expr]
+                    (cond
+                      (trivial? expr)
+                      (codegen out [:lda ;(operand expr)])
 
-(defn codegen-stmt [dst stmt]
+                      (= (expr :kind) :binop)
+                      (codegen-expr-binop out expr)
+
+                      (errorf "Cannot generate expression `%q`" (expr :kind)))))
+
+(defn codegen-stmt-return [out stmt] (codegen out [:rts :imp]))
+
+(defn codegen-stmt-call [out stmt]
+  (def callee (get-in stmt [:target :decl]))
+  (for i 0 (length (stmt :args))
+    (codegen-expr out ((stmt :args) i))
+    (codegen-store out (decl-operand ((callee :args) i))))
+  (codegen out [:jsr :abs (callee :label)])
+  (for i 0 (length (stmt :into))
+    (codegen out [:lda ;(decl-operand ((callee :returns) i))])
+    (codegen-store out (operand ((stmt :into) i)))))
+
+(defn codegen-stmt-set [out stmt]
+  (codegen-expr out (stmt :rvalue))
+  (codegen-store out (operand (stmt :lvalue))))
+
+(defn codegen-stmt [out stmt]
   (case (stmt :kind)
-    :set (do (codegen-expr dst (stmt :rvalue))
-             (gen-store dst (operand (stmt :lvalue))))
-    :call
-    (let [callee (get-in stmt [:target :decl])]
-      (for i 0 (length (stmt :args))
-        (codegen-expr dst ((stmt :args) i))
-        (gen-store dst (decl-operand ((callee :args) i))))
-      (gen dst :jsr :abs (callee :label))
-      (for i 0 (length (stmt :into))
-        (gen dst :lda ;(decl-operand ((callee :returns) i)))
-        (gen-store dst (operand ((stmt :into) i)))))
-
-    :return (gen dst :rts :imp)
+    :set    (codegen-stmt-set out stmt)
+    :call   (codegen-stmt-call out stmt)
+    :return (codegen-stmt-return out stmt)
     (errorf "Cannot generate statement `%V`" (stmt :kind))))
 
-(defn codegen-proc [dst proc]
-  (when-let [at (proc :at)] (gen dst :org at))
-  (codegen-label dst proc)
-  (each s (proc :body) (codegen-stmt dst s)))
+(defn codegen-proc [out proc]
+  (when-let [at (proc :at)] (codegen out [:org at]))
+  (codegen-label out proc)
+  (each stmt (proc :body) (codegen-stmt out stmt)))
 
 (defn codegen-program [prog]
-  (def equates @[]) # constants: label = value
-  (def main @[])
-  (def procs @[])
-  (def vars @[]) # variables: label .byte/.word value/?
-  (def fixed_procs @[]) # `proc` with `at`
+  (def equates     @[]) # constants: label = value 
+  (def main-body   @[])
+  (def procs       @[])
+  (def vars        @[]) # variables: label .fill size  
+  (def fixed-procs @[]) # `proc` with `at` 
 
-  (each d (prog :globals) (codegen-var d equates vars))
-  (each p (prog :procs)
-    (each d (p :args) (codegen-var d equates vars))
-    (each d (p :returns) (codegen-var d equates vars))
-    (each d (p :locals) (codegen-var d equates vars))
-    (codegen-proc (if (p :at) fixed_procs procs) p))
+  (each decl (prog :globals)   (codegen-decl equates vars decl))
+  (each proc (prog :procs)
+    (each decl (proc :args)    (codegen-decl equates vars decl))
+    (each decl (proc :returns) (codegen-decl equates vars decl))
+    (each decl (proc :locals)  (codegen-decl equates vars decl))
+    (codegen-proc (if (proc :at) fixed-procs procs) proc))
 
-  (when-let [at (prog :at)] (gen main :org at)) # * = at
-  (gen main :label (prog :label))
-  (each s (prog :body) (codegen-stmt main s))
-  (array/concat @[] equates main procs vars fixed_procs))
+  (when-let [at (prog :at)] (codegen main-body [:org at]))
+  (codegen main-body [:label (prog :label)])
+  (each stmt (prog :body) (codegen-stmt main-body stmt))
+  (array/concat @[]
+                equates
+                main-body
+                procs
+                vars
+                fixed-procs))
+
+# ------------- ASSEMBLY GENERATION (backend) ------------- #
 
 (def modes
-  {:imp  (fn [mnemonic _]     (string "    " mnemonic))
-   :imm  (fn [mnemonic value] (string "    " mnemonic " #" ;value))
-   :abs  (fn [mnemonic value] (string "    " mnemonic " " ;value))
-   :absx (fn [mnemonic value] (string "    " mnemonic " " ;value ",x"))
-   :absy (fn [mnemonic value] (string "    " mnemonic " " ;value ",y"))
-   :indy (fn [mnemonic value] (string "    " mnemonic " (" ;value "),y"))})
+  {:imp (fn [mnemonic]       (string "    " mnemonic))
+   :imm (fn [mnemonic value] (string "    " mnemonic " #" value))
+   :abs (fn [mnemonic value] (string "    " mnemonic " " value))})
 
 (defn emit-item [code]
   (match code
-    [:org addr]       (printf "* = $%04x" addr)
-    [:label labl]     (print labl)
-    [:equ labl value] (printf "%s = $%x" labl value)
-    [:res labl size]  (printf "%s .fill %d" labl size) 
-    [mnemonic mode & value] (print ((modes mode) mnemonic value))
-    (errorf "Malformed code `%q`" code)))
+    [:org addr]           (printf "* = $%04X" addr)
+    [:label labl]         (print labl)
+    [:equ labl value]     (printf "%s = $%X" labl value)
+    [:res labl size]      (printf "%s .fill %d" labl size)
+    [mnemonic :imp]       (print ((modes :imp) mnemonic))
+    [mnemonic mode value] (print ((modes mode) mnemonic value))
+    (errorf "Malformed code: `%q`" code)))
 
-(pp ast)
-(annotate-program ast) # side-effect: call-graph
-(check-cycles call-graph)
-(allocate-program ast)
-(def code (codegen-program ast))
-(pp code)
-(each item code (emit-item item))
+# ------------- WORKFLOW ------------- #
+
+(def source `program main at $0800 is
+result: byte at $f0;
+proc test (A: byte; B: byte) returns (C: byte) at $1000 is
+begin
+set C = A + B;
+return;
+end proc;
+begin
+call test (34, 35) into (result);
+return;
+end program;`)
+
+(each item (codegen-program (allocate-program (annotate-program (parse-program (lex source)))))
+  (emit-item item))
+
+# program main at $0800 is
+# result: byte at $f0;
+# proc test (A: byte; B: byte) returns (C: byte) at $1000 is
+# begin
+# set C = A + B;
+# return;
+# end proc;
+# begin
+# call test (34, 35) into (result);
+# return;
+# end program;
+# (def ast @{:kind :program
+#            :name "main"
+#            :at 0x800
+#            :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
+#            :procs @[@{:kind :proc
+#                       :at 0x1000
+#                       :name "test"
+#                       :args @[@{:kind :var :name "A" :type :byte}
+#                               @{:kind :var :name "B" :type :byte}]
+#                       :locals @[]
+#                       :returns @[@{:kind :var :name "C" :type :byte}]
+#                       :body @[@{:kind :set
+#                                 :lvalue @{:kind :ident :value "C"}
+#                                 :rvalue @{:kind :binop
+#                                           :op :add
+#                                           :lhs @{:kind :ident :value "A"}
+#                                           :rhs @{:kind :ident :value "B"}}}
+#                               @{:kind :return}]}]
+#            :body @[@{:kind :call
+#                      :target @{:kind :ident :value "test"}
+#                      :args   @[@{:kind :num :value 34}
+#                                @{:kind :num :value 35}]
+#                      :into   @[@{:kind :ident :value "result"}]}
+#                    @{:kind :return}]})
