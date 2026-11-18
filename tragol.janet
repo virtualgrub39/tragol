@@ -1,3 +1,14 @@
+# program main at $0800 is
+# result: byte at $f0;
+# proc test (A: byte; B: byte) returns (C: byte) at $1000 is
+# begin
+# set C = A + B;
+# return;
+# end proc;
+# begin
+# call test (34, 35) into (result);
+# return;
+# end program;
 (def ast @{:kind :program
            :name "main"
            :at 0x800
@@ -200,3 +211,62 @@
   prog)
 
 (pp (allocate-program (annotate-program ast)))
+
+# ------------- CODEGEN ------------- #
+
+# [:org at] -> * = at
+# [:label lbl] -> lbl
+# [:lda ;operand] -> lda operand
+# [:rts :imp] -> rst
+# 
+
+(defn codegen-stmt-return [out stmt] (codegen out [:rts :imp]))
+
+(defn codegen-stmt-call [out stmt]
+  (def callee (get-in stmt [:target :decl]))
+  (for i 0 (length (stmt :args))
+    (codegen-expr out ((stmt :args) :i))
+    (codegen-store out (decl-operand ((callee :args) i))))
+  (for i 0 (length (stmt :into))
+    (codegen out [:lda ;(decl-operand ((callee :returns) i))])
+    (codegen-store out (operand ((stmt :into) i)))))
+
+(defn codegen-stmt-set [out stmt]
+  (codegen-expr out (stmt :rvalue))
+  (codegen-store out (operand (stmt :lvalue))))
+
+(defn codegen-stmt [out stmt]
+  (case (stmt :kind)
+    :set    (codegen-stmt-set out stmt)
+    :call   (codegen-stmt-call out stmt)
+    :return (codegen-stmt-return out stmt)
+    (errorf "Cannot generate statement `%V`" (stmt :kind))))
+
+(defn codegen-proc [out proc]
+  (when-let [at (proc :at)] (codegen out [:org at]))
+  (codegen-label out proc)
+  (each stmt (proc :body) (codegen-stmt out stmt)))
+
+(defn codegen-program [prog]
+  (def equates     @[]) # constants: label = value 
+  (def main-body   @[])
+  (def procs       @[])
+  (def vars        @[]) # variables: label .fill size  
+  (def fixed-procs @[]) # `proc` with `at` 
+  
+  (each decl (prog :globals)   (codegen-decl equates vars decl))
+  (each proc (prog :procs)
+    (each decl (proc :args)    (codegen-decl equates vars decl))
+    (each decl (proc :returns) (codegen-decl equates vars decl))
+    (each decl (proc :locals)  (codegen-decl equates vars decl))
+    (codegen-proc (if (proc :at) fixed-procs procs) proc))
+  
+  (when-let [at (prog :at)] (codegen main-body [:org at]))
+  (codegen main-body [:label (prog :label)])
+  (each stmt (prog :body) (codegen-stmt main-body stmt))
+  (array/concat @[]
+                equates
+                main-body
+                procs
+                vars
+                fixed-procs))
