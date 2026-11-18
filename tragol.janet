@@ -205,6 +205,7 @@
 
 (defn allocate-program [prog]
   (assert (= (prog :kind) :program))
+  (put prog :label (prog :name))
   (each decl (prog :globals) (allocate-decl decl (decl :name)))
   (each proc (prog :procs)
     (allocate-proc proc))
@@ -227,7 +228,7 @@
     :ident true
     false))
 
-(defn codegen [out instr] (array/concat out instr))
+(defn codegen [out & instr] (array/concat out instr))
 
 (defn codegen-decl [equates vars decl]
   (cond
@@ -297,6 +298,7 @@
   (for i 0 (length (stmt :args))
     (codegen-expr out ((stmt :args) i))
     (codegen-store out (decl-operand ((callee :args) i))))
+  (codegen out [:jsr :abs (callee :label)])
   (for i 0 (length (stmt :into))
     (codegen out [:lda ;(decl-operand ((callee :returns) i))])
     (codegen-store out (operand ((stmt :into) i)))))
@@ -341,4 +343,24 @@
                 vars
                 fixed-procs))
 
-(pp (codegen-program (allocate-program (annotate-program ast))))
+# ------------- ASSEMBLY GENERATION (backend) ------------- #
+
+(def modes
+  {:imp (fn [mnemonic]       (string "    " mnemonic))
+   :imm (fn [mnemonic value] (string "    " mnemonic " #" value))
+   :abs (fn [mnemonic value] (string "    " mnemonic " " value))})
+
+(defn emit-item [code]
+  (match code
+    [:org addr]           (printf "* = $%04X" addr)
+    [:label labl]         (print labl)
+    [:equ labl value]     (printf "%s = $%X" labl value)
+    [:res labl size]      (printf "%s .fill %d" labl size)
+    [mnemonic :imp]       (print ((modes :imp) mnemonic))
+    [mnemonic mode value] (print ((modes mode) mnemonic value))
+    (errorf "Malformed code: `%q`" code)))
+
+# ------------- WORKFLOW ------------- #
+
+(each item (codegen-program (allocate-program (annotate-program ast)))
+  (emit-item item))
