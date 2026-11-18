@@ -1,38 +1,212 @@
-# program main at $0800 is
-# result: byte at $f0;
-# proc test (A: byte; B: byte) returns (C: byte) at $1000 is
-# begin
-# set C = A + B;
-# return;
-# end proc;
-# begin
-# call test (34, 35) into (result);
-# return;
-# end program;
-(def ast @{:kind :program
-           :name "main"
-           :at 0x800
-           :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
-           :procs @[@{:kind :proc
-                      :at 0x1000
-                      :name "test"
-                      :args @[@{:kind :var :name "A" :type :byte}
-                              @{:kind :var :name "B" :type :byte}]
-                      :locals @[]
-                      :returns @[@{:kind :var :name "C" :type :byte}]
-                      :body @[@{:kind :set
-                                :lvalue @{:kind :ident :value "C"}
-                                :rvalue @{:kind :binop
-                                          :op :add
-                                          :lhs @{:kind :ident :value "A"}
-                                          :rhs @{:kind :ident :value "B"}}}
-                              @{:kind :return}]}]
-           :body @[@{:kind :call
-                     :target @{:kind :ident :value "test"}
-                     :args   @[@{:kind :num :value 34}
-                               @{:kind :num :value 35}]
-                     :into   @[@{:kind :ident :value "result"}]}
-                   @{:kind :return}]})
+# ------------- LEXING ------------- #
+
+(def- trivial-toks
+  {":"   :colon      ";"   :semicolon   "," :comma
+   "="   :equals     "("   :left-paren  ")" :right-paren
+   "\\/" :logical-or "/\\" :logical-and "[" :left-bracket
+   "]"   :right-bracket "+" :plus "-" :minus "?=" :compare
+   "(+)" :logical-xor})
+
+(def- keywords
+  {"proc"    :kw-proc    "is"     :kw-is
+   "begin"   :kw-begin   "end"    :kw-end
+   "set"     :kw-set     "returns" :kw-returns
+   "byte"    :kw-byte    "address" :kw-address
+   "program" :kw-program "at"     :kw-at
+   "into"    :kw-into    "call"   :kw-call
+   "return"  :kw-return})
+
+(def- punct-strings (sort-by |(- (length $)) (keys trivial-toks)))
+
+(def- lexer
+  (peg/compile
+   ~{:ws (+ (set " \t\r\n") (* "--" (any (if-not "\n" 1))))
+     :punct  (/ (capture (choice ,;punct-strings))
+                ,(fn [s] [(trivial-toks s)]))
+     :word   (/ (capture (* (+ :a "_") (any (+ :w "_"))))
+                ,(fn [w] (if-let [kw (keywords w)] [kw] [:ident w])))
+     :number (/ (capture (* (some :d) (not :w)))
+                ,(fn [n] [:num (scan-number n)]))
+     :hex (/ (capture (* "$" (some :h) (not :w)))
+             ,(fn [s] [:num (scan-number (string "0x" (string/slice s 1)))]))
+     :token (/ (* ($) (+ :punct :word :hex :number)) ,(fn [p [k v]] [k v p]))
+     :main   (* (any (* (any :ws) :token)) (any :ws) ($))}))
+
+(defn lex [src]
+  (def toks (peg/match lexer src))
+  (def pos (array/pop toks))
+  (if (< pos (length src))
+    (errorf "Syntax error near %q" (string/slice src pos (min (length src) (+ pos 10))))
+    (array/push toks [:eof])))
+
+# ------------- PARSING ------------- #
+
+(var- pos 0)
+(var- toks nil)
+
+(defn- peek [] (get toks pos))
+(defn- kind [] (get (peek) 0))
+(defn- at? [tag] (= (kind) tag))
+(defn- next! [] (def t (toks pos)) (unless (at? :eof) (++ pos)) t)
+(defn- accept [k] (when (at? k) (next!)))
+(defn- expect [k]
+  (if (at? k)
+    (next!)
+    (errorf "expected %v, got %v at offset %d" k (kind) ((toks pos) 2))))
+(defn- expect-name [] ((expect :ident) 1))
+(defn- expect-num [] ((expect :num) 1))
+
+(defn expect-type []
+  (def type-name (expect-name))
+  (case type-name
+    "byte" :byte
+    "address" :address
+    (errorf "Expected type name, got `%s`" type-name)))
+
+(defn- fail [what]
+  (errorf "expected %s, got %v at offset %v" what (kind) ((toks pos) 2)))
+
+(defn- expect-name [] ((expect :ident) 1))
+(defn- expect-num  [] ((expect :num) 1))
+(defn- expect-type []
+  (case (kind)
+    :kw-byte    (do (next!) :byte)
+    :kw-address (do (next!) :address)
+    (fail "type")))
+
+# '(' item (sep item)* ')'
+(defn- parse-list [item sep]
+  (expect :left-paren)
+  (def items @[])
+  (unless (at? :right-paren)
+    (array/push items (item))
+    (while (accept sep)
+      (array/push items (item))))
+  (expect :right-paren)
+  items)
+
+(defn- parse-typed-name []
+  (def name (expect-name))
+  (expect :colon)
+  (def typ (expect-type))
+  @{:kind :var :name name :type typ})
+
+(defn- parse-var-decl []
+  (def v (parse-typed-name))
+  (when (accept :kw-at) (put v :at (expect-num)))
+  (expect :semicolon)
+  v)
+
+(defn- parse-var-decls []            # for proc locals
+  (def out @[])
+  (while (not (at? :kw-begin))
+    (array/push out (parse-var-decl)))
+  out)
+
+(def- binary-ops
+  {:logical-or  {:bp 10 :op :or}   # weakest 
+   :logical-xor {:bp 15 :op :xor}
+   :logical-and {:bp 20 :op :and}
+   :plus        {:bp 40 :op :add}
+   :minus       {:bp 40 :op :sub}}) # strongest
+
+(defn- parse-ident []
+  @{:kind :ident :value (expect-name)})
+
+(defn parse-expr [&opt min-bp]
+  (default min-bp 0)
+  (var lhs
+       (case (kind)
+         :num        (let [t (next!)] @{:kind :num :value (t 1)})
+         :ident      (parse-ident)
+         :left-paren (do (next!)
+                         (def e (parse-expr 0))
+                         (expect :right-paren)
+                         e)
+         (fail "expression")))
+  (forever
+    (def info (binary-ops (kind)))
+    (when (or (nil? info) (< (info :bp) min-bp)) (break))
+    (next!)
+    (def rhs (parse-expr (+ (info :bp) 1)))
+    (set lhs @{:kind :binop :op (info :op) :lhs lhs :rhs rhs}))
+  lhs)
+
+(defn- parse-stmt-set []
+  (expect :kw-set)
+  (def lvalue (parse-ident))
+  (expect :equals)
+  (def rvalue (parse-expr))
+  (expect :semicolon)
+  @{:kind :set :lvalue lvalue :rvalue rvalue})
+
+(defn- parse-stmt-return []
+  (expect :kw-return)
+  (expect :semicolon)
+  @{:kind :return})
+
+(defn- parse-stmt-call []
+  (expect :kw-call)
+  (def target (parse-ident))
+  (def args (parse-list parse-expr :comma))
+  (def into (if (accept :kw-into) (parse-list parse-ident :comma) @[]))
+  (expect :semicolon)
+  @{:kind :call :target target :args args :into into})
+
+(defn- parse-stmts []
+  (def stmts @[])
+  (while (not (at? :kw-end))
+    (array/push stmts
+                (case (kind)
+                  :kw-set    (parse-stmt-set)
+                  :kw-return (parse-stmt-return)
+                  :kw-call   (parse-stmt-call)
+                  (fail "statement"))))
+  stmts)
+
+(defn- parse-proc []
+  (expect :kw-proc)
+  (def name (expect-name))
+  (def args (if (at? :left-paren)
+              (parse-list parse-typed-name :semicolon) @[]))
+  (def returns (if (accept :kw-returns)
+                 (parse-list parse-typed-name :semicolon) @[]))
+  (def addr (when (accept :kw-at) (expect-num)))
+  (expect :kw-is)
+  (def locals (parse-var-decls))
+  (expect :kw-begin)
+  (def body (parse-stmts))
+  (expect :kw-end)
+  (expect :kw-proc)
+  (expect :semicolon)
+  @{:kind :proc :name name :at addr :args args
+    :locals locals :returns returns :body body})
+
+(defn- parse-decls []                # program level: vars and procs mixed
+  (def globals @[])
+  (def procs @[])
+  (while (not (at? :kw-begin))
+    (if (at? :kw-proc)
+      (array/push procs (parse-proc))
+      (array/push globals (parse-var-decl))))
+  [globals procs])
+
+(defn parse-program [tokens]
+  (set toks tokens)
+  (set pos 0)
+  (expect :kw-program)
+  (def name (expect-name))
+  (def addr (when (accept :kw-at) (expect-num)))
+  (expect :kw-is)
+  (def [globals procs] (parse-decls))
+  (expect :kw-begin)
+  (def body (parse-stmts))
+  (expect :kw-end)
+  (expect :kw-program)
+  (expect :semicolon)
+  (expect :eof)
+  @{:kind :program :name name :at addr
+    :globals globals :procs procs :body body})
 
 (def type-info
   {:byte    {:fits? (fn [v] (<= v 255))
@@ -81,10 +255,10 @@
       (put expr :decl decl)
       (put expr :type (decl :type))
       (decl :type))
-    
+
     :num
     (errorf "Cannot infer type of number literal `%q`" (expr :value))
-    
+
     :binop
     (let [lhs-type (infer-expr-type scope (expr :lhs))
           rhs-type (infer-expr-type scope (expr :rhs))]
@@ -92,7 +266,7 @@
         (errorf "Type missmatch in `%q`: %V vs %V" expr lhs-type rhs-type))
       (put expr :type lhs-type)
       lhs-type)
-    
+
     (errorf "Cannot infer type of expression `%q`" expr)))
 
 (var expect-binop-type nil)
@@ -104,18 +278,18 @@
       (unless (= expected-type actual-type)
         (errorf "Type missmatch for `%s`: expected %V, got %V" (expr :value) expected-type actual-type))
       actual-type)
-    
+
     :num
     (do
       (unless (((type-info expected-type) :fits?) (expr :value))
         (errorf "Value %d doesn't fit in type %V" (expr :value) expected-type))
       (put expr :type expected-type)
       expected-type)
-    
+
     :binop
     (expect-binop-type scope expr expected-type)))
 
-(set expect-binop-type 
+(set expect-binop-type
      (fn [scope expr expected-type]
        (case (expr :op)
          :add
@@ -132,7 +306,7 @@
 (defn expect-lvalue-type [scope expr expected-type]
   (unless (assignable? expr)
     (errorf "Expression `%q` is not a valid lvalue" expr))
-  
+
   (let [actual-type (infer-expr-type scope expr)]
     (unless (= actual-type expected-type)
       (errorf "Expected lvalue of type %V, got %V"
@@ -169,7 +343,7 @@
   (assert (= (proc :kind) :proc))
 
   (def scope (new-scope parent))
-  
+
   (declare-all scope (proc :args))
   (declare-all scope (proc :locals))
   (declare-all scope (proc :returns))
@@ -177,9 +351,9 @@
 
 (defn annotate-program [prog]
   (assert (= (prog :kind) :program))
-  
+
   (def scope (new-scope nil))
-  
+
   (declare-all scope (prog :globals))
   (each proc (prog :procs) (declare scope proc))
   (each proc (prog :procs) (annotate-proc scope proc))
@@ -198,7 +372,7 @@
 
 (defn allocate-proc [proc]
   (assert (= (proc :kind) :proc))
-  (put proc :label (proc :name)) 
+  (put proc :label (proc :name))
   (each decl (proc :args)    (allocate-decl decl (string (proc :name) "_" (decl :name))))
   (each decl (proc :returns) (allocate-decl decl (string (proc :name) "_" (decl :name))))
   (each decl (proc :locals)  (allocate-decl decl (string (proc :name) "_" (decl :name)))))
@@ -251,7 +425,7 @@
 (defn codegen-store [dst oprnd]
   (codegen dst [:sta ;oprnd]))
 
-(defn codegen-add [out operands] 
+(defn codegen-add [out operands]
   (codegen out [:clc :imp])
   (codegen out [:adc ;operands]))
 
@@ -269,27 +443,27 @@
   (def op (binops (expr :op)))
   (def lhs (expr :lhs))
   (def rhs (expr :rhs))
-  
+
   (cond
     (trivial? rhs)
     (do (codegen-expr out lhs) # ex. (b * c) + a
         ((op :gen) out (operand rhs)))
-    
+
     (and (op :commutative) (trivial? lhs)) # ex. a + (b * c)
     (do (codegen-expr out rhs) # swap sides
         ((op :gen) out (operand lhs)))
-    
+
     (errorf "Expression too complex; split it into two statements pls")))
 
 (set codegen-expr (fn [out expr]
-  (cond
-    (trivial? expr)
-    (codegen out [:lda ;(operand expr)])
+                    (cond
+                      (trivial? expr)
+                      (codegen out [:lda ;(operand expr)])
 
-    (= (expr :kind) :binop)
-    (codegen-expr-binop out expr)
-    
-    (errorf "Cannot generate expression `%q`" (expr :kind)))))
+                      (= (expr :kind) :binop)
+                      (codegen-expr-binop out expr)
+
+                      (errorf "Cannot generate expression `%q`" (expr :kind)))))
 
 (defn codegen-stmt-return [out stmt] (codegen out [:rts :imp]))
 
@@ -325,14 +499,14 @@
   (def procs       @[])
   (def vars        @[]) # variables: label .fill size  
   (def fixed-procs @[]) # `proc` with `at` 
-  
+
   (each decl (prog :globals)   (codegen-decl equates vars decl))
   (each proc (prog :procs)
     (each decl (proc :args)    (codegen-decl equates vars decl))
     (each decl (proc :returns) (codegen-decl equates vars decl))
     (each decl (proc :locals)  (codegen-decl equates vars decl))
     (codegen-proc (if (proc :at) fixed-procs procs) proc))
-  
+
   (when-let [at (prog :at)] (codegen main-body [:org at]))
   (codegen main-body [:label (prog :label)])
   (each stmt (prog :body) (codegen-stmt main-body stmt))
@@ -362,5 +536,53 @@
 
 # ------------- WORKFLOW ------------- #
 
-(each item (codegen-program (allocate-program (annotate-program ast)))
+(def source `program main at $0800 is
+result: byte at $f0;
+proc test (A: byte; B: byte) returns (C: byte) at $1000 is
+begin
+set C = A + B;
+return;
+end proc;
+begin
+call test (34, 35) into (result);
+return;
+end program;`)
+
+(each item (codegen-program (allocate-program (annotate-program (parse-program (lex source)))))
   (emit-item item))
+
+# program main at $0800 is
+# result: byte at $f0;
+# proc test (A: byte; B: byte) returns (C: byte) at $1000 is
+# begin
+# set C = A + B;
+# return;
+# end proc;
+# begin
+# call test (34, 35) into (result);
+# return;
+# end program;
+# (def ast @{:kind :program
+#            :name "main"
+#            :at 0x800
+#            :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
+#            :procs @[@{:kind :proc
+#                       :at 0x1000
+#                       :name "test"
+#                       :args @[@{:kind :var :name "A" :type :byte}
+#                               @{:kind :var :name "B" :type :byte}]
+#                       :locals @[]
+#                       :returns @[@{:kind :var :name "C" :type :byte}]
+#                       :body @[@{:kind :set
+#                                 :lvalue @{:kind :ident :value "C"}
+#                                 :rvalue @{:kind :binop
+#                                           :op :add
+#                                           :lhs @{:kind :ident :value "A"}
+#                                           :rhs @{:kind :ident :value "B"}}}
+#                               @{:kind :return}]}]
+#            :body @[@{:kind :call
+#                      :target @{:kind :ident :value "test"}
+#                      :args   @[@{:kind :num :value 34}
+#                                @{:kind :num :value 35}]
+#                      :into   @[@{:kind :ident :value "result"}]}
+#                    @{:kind :return}]})
