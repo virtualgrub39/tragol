@@ -1,0 +1,11 @@
+program main is
+    result: byte at $fe;
+
+    proc test (foo: byte; bar: byte) returns (baz: byte) is
+    begin
+        set baz = foo + bar - 33;
+        return;
+    end proc;
+begin
+    call test (34, 35) into (result);
+end program;

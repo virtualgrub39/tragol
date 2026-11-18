@@ -56,18 +56,9 @@
 (defn- expect-name [] ((expect :ident) 1))
 (defn- expect-num [] ((expect :num) 1))
 
-(defn expect-type []
-  (def type-name (expect-name))
-  (case type-name
-    "byte" :byte
-    "address" :address
-    (errorf "Expected type name, got `%s`" type-name)))
-
 (defn- fail [what]
   (errorf "expected %s, got %v at offset %v" what (kind) ((toks pos) 2)))
 
-(defn- expect-name [] ((expect :ident) 1))
-(defn- expect-num  [] ((expect :num) 1))
 (defn- expect-type []
   (case (kind)
     :kw-byte    (do (next!) :byte)
@@ -287,17 +278,20 @@
       expected-type)
 
     :binop
-    (expect-binop-type scope expr expected-type)))
+    (expect-binop-type scope expr expected-type)
+
+    (errorf "Cannot type-check expression `%q`" expr)))
+
+(def- typed-binops {:add true :sub true})  # ops that codegen actually supports
 
 (set expect-binop-type
      (fn [scope expr expected-type]
-       (case (expr :op)
-         :add
-         (do
-           (expect-expr-type scope (expr :lhs) expected-type)
-           (expect-expr-type scope (expr :rhs) expected-type)
-           (put expr :type expected-type)
-           expected-type))))
+       (unless (typed-binops (expr :op))
+         (errorf "Operator %V is not supported yet" (expr :op)))
+       (expect-expr-type scope (expr :lhs) expected-type)
+       (expect-expr-type scope (expr :rhs) expected-type)
+       (put expr :type expected-type)
+       expected-type))
 
 (defn verify-arity [what name expected got]
   (unless (= (length expected) (length got))
@@ -536,20 +530,26 @@
 
 # ------------- WORKFLOW ------------- #
 
-(def source `program main at $0800 is
-result: byte at $f0;
-proc test (A: byte; B: byte) returns (C: byte) at $1000 is
-begin
-set C = A + B;
-return;
-end proc;
-begin
-call test (34, 35) into (result);
-return;
-end program;`)
+# this is the same as in `examples/basic.tgl`
+(def source `program main is
+    result: byte at $fe;
 
-(each item (codegen-program (allocate-program (annotate-program (parse-program (lex source)))))
-  (emit-item item))
+    proc test (foo: byte; bar: byte) returns (baz: byte) is
+    begin
+        set baz = (foo + bar) - 33;
+        return;
+    end proc;
+begin
+    call test (34, 35) into (result);
+end program;
+`)
+
+(defn main [& args]
+  (when (= (length args) 1)
+    (errorf "Usage: %s src-path" (args 0)))
+  (def src (slurp (args 1)))
+  (each item (codegen-program (allocate-program (annotate-program (parse-program (lex src)))))
+    (emit-item item)))
 
 # program main at $0800 is
 # result: byte at $f0;
