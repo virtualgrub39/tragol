@@ -95,7 +95,7 @@
   out)
 
 (def- binary-ops
-  {:logical-or  {:bp 10 :op :or}   # weakest 
+  {:logical-or  {:bp 10 :op :or}   # weakest
    :logical-xor {:bp 15 :op :xor}
    :logical-and {:bp 20 :op :and}
    :plus        {:bp 40 :op :add}
@@ -210,6 +210,7 @@
 (defn assignable? [expr]
   (case (expr :kind)
     :ident true
+    :deref-ident true
     false))
 
 (defn new-scope [parent] @{:names @{} :parent parent})
@@ -258,6 +259,42 @@
       (put expr :type lhs-type)
       lhs-type)
 
+    :deref-ident
+    (let [what (expr :what)
+          idx  (expr :idx)]
+      (unless (= (what :kind) :ident)
+        (errorf "Can only index an identifier for now"))
+      (def decl (resolve scope what))
+      (if (= (idx :kind) :num)
+        (do
+          (unless (((type-info :byte) :fits?) (idx :value))
+            (errorf "Array index %d doesn't fit in :byte" (idx :value)))
+          (put idx :type :byte))
+        (let [idx-type (infer-expr-type scope idx)]
+          (unless (= :byte idx-type)
+            (errorf "Array index must be :byte, got %V" idx-type))))
+      (case (decl :kind)
+        :array
+        (do
+          (put expr :type (decl :type))
+          (decl :type))
+        :var
+        (if (= (decl :type) :address)
+          (do
+            (put expr :type :byte)
+            :byte)
+          (errorf "Cannot index value of type %V" (decl :type)))
+        (errorf "Cannot index value of kind %V" (decl :kind))))
+
+    :addrof
+    (do
+      (def what (expr :what))
+      (unless (= (what :kind) :ident)
+        (errorf "Can only take the address of an identifier for now"))
+      (resolve scope what)
+      (put expr :type :address)
+      :address)
+
     (errorf "Cannot infer type of expression `%q`" expr)))
 
 (var expect-binop-type nil)
@@ -272,6 +309,8 @@
 
     :num
     (do
+      (unless (type-info expected-type)
+        (errorf "Internal: expected-type is %q, not a known type" expected-type))
       (unless (((type-info expected-type) :fits?) (expr :value))
         (errorf "Value %d doesn't fit in type %V" (expr :value) expected-type))
       (put expr :type expected-type)
@@ -279,6 +318,18 @@
 
     :binop
     (expect-binop-type scope expr expected-type)
+
+    :deref-ident
+    (let [actual-type (infer-expr-type scope expr)]
+      (unless (= expected-type actual-type)
+        (errorf "Type missmatch: expected %V, got %V" expected-type actual-type))
+      actual-type)
+
+    :addrof
+    (let [actual-type (infer-expr-type scope expr)]
+      (unless (= expected-type actual-type)
+        (errorf "Type missmatch: expected %V, got %V" expected-type actual-type))
+      actual-type)
 
     (errorf "Cannot type-check expression `%q`" expr)))
 
@@ -361,20 +412,20 @@
 (defn build-call-graph [prog]
   (def graph @{})
   (defn ensure [n] (unless (graph n) (put graph n @[])))
-  
+
   (ensure main-node)
   (each proc (prog :procs) (ensure (proc :name)))
-  
+
   (defn scan-body [from body]
     (each stmt body
       (when (= (stmt :kind) :call)
         (def callee (get-in stmt [:target :decl :name]))
         (array/push (graph from) callee))))
-  
+
   (scan-body main-node (prog :body))
   (each proc (prog :procs)
     (scan-body (proc :name) (proc :body)))
-  
+
   graph)
 
 (defn check-cycles [graph]
@@ -432,31 +483,36 @@
       (+= n ((type-info (decl :type)) :size))))
   n)
 
+(defn decl-size [decl]
+  (case (decl :kind)
+    :array (* (decl :length) ((type-info (decl :type)) :size))
+    ((type-info (decl :type)) :size)))
+
 (defn assign-proc-labels [proc depth]
   (var off 0)
   (each decl (proc-all-vars proc)
-    (put decl :size ((type-info (decl :type)) :size))
+    (put decl :size (decl-size decl))
     (if (decl :at)
       (put decl :label (string (proc :name) "_" (decl :name)))
       (do
         (put decl :label (string "frame_" depth "+" off))
-        (+= off ((type-info (decl :type)) :size))))))
+        (+= off (decl :size))))))
 
 (defn allocate-shared-frames [prog]
   (def graph (build-call-graph prog))
   (check-cycles graph)
   (def depths (compute-depths graph main-node))
-  
+
   (def procs-by-depth @{})
   (each proc (prog :procs)
     (def depth (depths (proc :name)))
     (unless (get procs-by-depth depth) (put procs-by-depth depth @[]))
     (array/push (procs-by-depth depth) proc))
-  
+
   (each depth (keys procs-by-depth)
     (each proc (procs-by-depth depth)
       (assign-proc-labels proc depth)))
-  
+
   (def frames @[])
   (each depth (sorted (keys procs-by-depth))
     (var max-size 0)
@@ -475,7 +531,7 @@
 
   (each decl (prog :globals)
     (put decl :label (decl :name))
-    (put decl :size ((type-info (decl :type)) :size)))
+    (put decl :size (decl-size decl)))
 
   (put prog :frames (allocate-shared-frames prog))
   prog)
@@ -520,6 +576,11 @@
 (defn codegen-store [dst oprnd]
   (codegen dst [:sta ;oprnd]))
 
+(defn codegen-copy-value [out src-operand dst-label size]
+  (for off 0 size
+    (codegen out [:lda ;src-operand])
+    (codegen out [:sta :abs (string dst-label "+" off)])))
+
 (defn codegen-add [out operands]
   (codegen out [:clc :imp])
   (codegen out [:adc ;operands]))
@@ -550,31 +611,127 @@
 
     (errorf "Expression too complex; split it into two statements pls")))
 
-(set codegen-expr (fn [out expr]
-                    (cond
-                      (trivial? expr)
-                      (codegen out [:lda ;(operand expr)])
+(defn codegen-deref-read [out expr]
+  (def decl ((expr :what) :decl))
+  (def idx (expr :idx))
 
-                      (= (expr :kind) :binop)
-                      (codegen-expr-binop out expr)
+  (case (decl :kind)
+    :array
+    (do
+      (codegen-expr out idx)
+      (codegen out [:tay :imp])
+      (codegen out [:lda :abs-y (decl :label)]))
+    :var
+    (do
+      (codegen-expr out idx)
+      (codegen out [:tay :imp])
+      (codegen out [:lda :abs   (decl :label)])
+      (codegen out [:sta :abs   "tragolptr0"])
+      (codegen out [:lda :abs   (string (decl :label) "+1")])
+      (codegen out [:sta :abs   "tragolptr0+1"])
+      (codegen out [:lda :ind-y "tragolptr0"]))))
 
-                      (errorf "Cannot generate expression `%q`" (expr :kind)))))
+(defn codegen-deref-store [out lvalue]
+  (def decl ((lvalue :what) :decl))
+  (def idx  (lvalue :idx))
+
+  (case (decl :kind)
+    :array
+    (do
+      (codegen-expr out idx)
+      (codegen out [:tay :imp])
+      (codegen out [:pla :imp])
+      (codegen out [:sta :abs-y (decl :label)]))
+
+    :var
+    (do
+      (codegen-expr out idx)
+      (codegen out [:tay :imp])
+      (codegen out [:lda :abs   (decl :label)])
+      (codegen out [:sta :abs   "tragolptr0"])
+      (codegen out [:lda :abs   (string (decl :label) "+1")])
+      (codegen out [:sta :abs   "tragolptr0+1"])
+      (codegen out [:pla :imp])
+      (codegen out [:sta :ind-y "tragolptr0"]))
+
+    (errorf "Cannot store to deref of kind %V" (decl :kind))))
+
+(set codegen-expr
+     (fn [out expr]
+       (cond
+         (trivial? expr)
+         (codegen out [:lda ;(operand expr)])
+
+         (= (expr :kind) :binop)
+         (codegen-expr-binop out expr)
+
+         (= (expr :kind) :deref-ident)
+         (codegen-deref-read out expr)
+
+         (= (expr :kind) :addrof)
+         (errorf "& is only supported for right-hand-side of `set` (for now?)")
+
+         (errorf "Cannot generate expression `%q`" (expr :kind)))))
 
 (defn codegen-stmt-return [out stmt] (codegen out [:rts :imp]))
+
+(defn codegen-arg [out arg arg-decl]
+  (case (arg-decl :type)
+    :address
+    (let [src (get-in arg [:decl :label])
+          dst (arg-decl :label)]
+      (codegen out [:lda :abs src])
+      (codegen out [:sta :abs dst])
+      (codegen out [:lda :abs (string src "+1")])
+      (codegen out [:sta :abs (string dst "+1")]))
+    (do
+      (codegen-expr out arg)
+      (codegen-store out (decl-operand arg-decl)))))
 
 (defn codegen-stmt-call [out stmt]
   (def callee (get-in stmt [:target :decl]))
   (for i 0 (length (stmt :args))
-    (codegen-expr out ((stmt :args) i))
-    (codegen-store out (decl-operand ((callee :args) i))))
+    (codegen-arg out ((stmt :args) i) ((callee :args) i)))
   (codegen out [:jsr :abs (callee :label)])
   (for i 0 (length (stmt :into))
-    (codegen out [:lda ;(decl-operand ((callee :returns) i))])
-    (codegen-store out (operand ((stmt :into) i)))))
+    (let [dst ((stmt :into) i)
+          ret ((callee :returns) i)]
+      (case (ret :type)
+        :address
+        (do
+          (codegen out [:lda :abs (ret :label)])
+          (codegen out [:sta :abs (get-in dst [:decl :label])])
+          (codegen out [:lda :abs (string (ret :label) "+1")])
+          (codegen out [:sta :abs (string (get-in dst [:decl :label]) "+1")]))
+        (do
+          (codegen out [:lda :abs (ret :label)])
+          (codegen-store out (operand dst)))))))
 
 (defn codegen-stmt-set [out stmt]
-  (codegen-expr out (stmt :rvalue))
-  (codegen-store out (operand (stmt :lvalue))))
+  (def lvalue (stmt :lvalue))
+  (def rvalue (stmt :rvalue))
+
+  (cond
+    (and (= (lvalue :kind) :ident)
+         (= (rvalue :kind) :addrof))
+    (let [src-decl  ((rvalue :what) :decl)
+          src-label (src-decl :label)
+          dst-label (get-in lvalue [:decl :label])]
+      (codegen out [:lda :imm (string "<" src-label)])
+      (codegen out [:sta :abs dst-label])
+      (codegen out [:lda :imm (string ">" src-label)])
+      (codegen out [:sta :abs (string dst-label "+1")]))
+
+    (= (lvalue :kind) :ident)
+    (do (codegen-expr out rvalue)
+        (codegen-store out (operand lvalue)))
+
+    (= (lvalue :kind) :deref-ident)
+    (do (codegen-expr out rvalue)
+        (codegen out [:pha :imp])
+        (codegen-deref-store out lvalue))
+
+    (errorf "Cannot assign to `%q`" lvalue)))
 
 (defn codegen-stmt [out stmt]
   (case (stmt :kind)
@@ -589,25 +746,27 @@
   (each stmt (proc :body) (codegen-stmt out stmt)))
 
 (defn codegen-program [prog]
-  (def equates     @[]) # constants: label = value 
+  (def equates     @[]) # constants: label = value
   (def main-body   @[])
   (def procs       @[])
-  (def vars        @[]) # variables: label .fill size  
-  (def fixed-procs @[]) # `proc` with `at` 
+  (def vars        @[]) # variables: label .fill size
+  (def fixed-procs @[]) # `proc` with `at`
+
+  (codegen equates [:equ "tragolptr0"   0xFB]) # TODO: configurable
 
   (each decl (prog :globals)
     (if (decl :at)
       (codegen equates [:equ (decl :label) (decl :at)])
-      (codegen vars    [:res (decl :label) (decl :size)]))) 
-  
+      (codegen vars    [:res (decl :label) (decl :size)])))
+
   (each proc (prog :procs)
     (each decl (proc-all-vars proc)
       (when (decl :at)
         (codegen equates [:equ (decl :label) (decl :at)]))))
-  
+
   (each frame (prog :frames)
     (codegen vars [:res (frame :label) (frame :size)]))
-  
+
   (each proc (prog :procs)
     (codegen-proc (if (proc :at) fixed-procs procs) proc))
 
@@ -620,9 +779,12 @@
 # ------------- ASSEMBLY GENERATION (backend) ------------- #
 
 (def modes
-  {:imp (fn [mnemonic]       (string "    " mnemonic))
-   :imm (fn [mnemonic value] (string "    " mnemonic " #" value))
-   :abs (fn [mnemonic value] (string "    " mnemonic " " value))})
+  {:imp   (fn [mnemonic]       (string "    " mnemonic))
+   :imm   (fn [mnemonic value] (string "    " mnemonic " #" value))
+   :abs   (fn [mnemonic value] (string "    " mnemonic " " value))
+   :abs-x (fn [mnemonic value] (string "    " mnemonic " " value ",x"))
+   :abs-y (fn [mnemonic value] (string "    " mnemonic " " value ",y"))
+   :ind-y (fn [mnemonic value] (string "    " mnemonic " (" value "),y"))})
 
 (defn emit-item [code]
   (match code
@@ -637,24 +799,66 @@
 # ------------- WORKFLOW ------------- #
 
 # this is the same as in `examples/basic.tgl`
-(def source `program main is
-    result: byte at $fe;
+(def source `program addressing is
+    buffer: 10 of byte;  -- buffer .fill 10
+    i: byte;
+    buffer_ptr: address;
 
-    proc test (foo: byte; bar: byte) returns (baz: byte) is
+    proc stuff (ptr: address; idx: byte) returns (thing: byte) is
     begin
-        set baz = (foo + bar) - 33;
+        set thing = ptr[idx]; -- lda (ptr),idx
         return;
     end proc;
 begin
-    call test (34, 35) into (result);
+    set buffer_ptr = &buffer;
+    set i = 3;
+
+    set buffer[i] = 69; -- lda buffer,i -- I think?
+
+    call stuff (buffer_ptr, i) into (i);
 end program;
 `)
+(def ast @{:kind :program
+           :name "addressing"
+           :globals @[@{:kind :array :name "buffer" :length 10 :type :byte}
+                      @{:kind :var :name "i" :type :byte}
+                      @{:kind :var :name "buffer_ptr" :type :address}]
+           :procs @[@{:kind :proc
+                      :name "stuff"
+                      :args @[@{:kind :var :name "ptr" :type :address}
+                              @{:kind :var :name "idx" :type :byte}]
+                      :locals @[]
+                      :returns @[@{:kind :var :name "thing" :type :byte}]
+                      :body @[@{:kind :set
+                                :lvalue @{:kind :ident :value "thing"}
+                                :rvalue @{:kind :deref-ident
+                                          :what @{:kind :ident :value "ptr"}
+                                          :idx @{:kind :ident :value "idx"}}}
+                              @{:kind :return}]}]
+           :body @[@{:kind :set
+                     :lvalue @{:kind :ident :value "buffer_ptr"}
+                     :rvalue @{:kind :addrof
+                               :what @{:kind :ident :value "buffer"}}}
+                   @{:kind :set
+                     :lvalue @{:kind :ident :value "i"}
+                     :rvalue @{:kind :num :value 3}}
+                   @{:kind :set
+                     :lvalue @{:kind :deref-ident
+                               :what @{:kind :ident :value "buffer"}
+                               :idx @{:kind :ident :value "i"}}
+                     :rvalue @{:kind :num :value 69}}
+                   @{:kind :call
+                     :target @{:kind :ident :value "stuff"}
+                     :args @[@{:kind :ident :value "buffer_ptr"}
+                             @{:kind :ident :value "i"}]
+                     :into @[@{:kind :ident :value "i"}]}]})
 
 (defn main [& args]
   (when (< (length args) 2)
     (errorf "Usage: %s src-path" (args 0)))
   (def src (slurp (args 1)))
-  (def program (annotate-program (parse-program (lex src))))
+  # (def program (annotate-program (parse-program (lex src))))
+  (def program (annotate-program ast))
   (each item (codegen-program (allocate-program program))
     (emit-item item)))
 

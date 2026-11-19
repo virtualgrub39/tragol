@@ -1,0 +1,18 @@
+program addressing is
+    buffer: 10 of byte;  -- buffer .fill 10
+    i: byte;
+    buffer_ptr: address;
+
+    proc stuff (ptr: address; idx: byte) returns (thing: byte) is
+    begin
+        set thing = ptr[idx]; -- lda (ptr),idx
+        return;
+    end proc;
+begin
+    set buffer_ptr = &buffer;
+    set i = 3;
+
+    set buffer[i] = 69; -- lda buffer,i -- I think?
+
+    call stuff (buffer_ptr, i) into (i);
+end program;
