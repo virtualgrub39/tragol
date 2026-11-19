@@ -5,7 +5,7 @@
    "="   :equals     "("   :left-paren  ")" :right-paren
    "\\/" :logical-or "/\\" :logical-and "[" :left-bracket
    "]"   :right-bracket "+" :plus "-" :minus "?=" :compare
-   "(+)" :logical-xor})
+   "(+)" :logical-xor "&" :addrof})
 
 (def- keywords
   {"proc"    :kw-proc    "is"     :kw-is
@@ -14,7 +14,7 @@
    "byte"    :kw-byte    "address" :kw-address
    "program" :kw-program "at"     :kw-at
    "into"    :kw-into    "call"   :kw-call
-   "return"  :kw-return})
+   "return"  :kw-return   "of"    :kw-of})
 
 (def- punct-strings (sort-by |(- (length $)) (keys trivial-toks)))
 
@@ -79,8 +79,15 @@
 (defn- parse-typed-name []
   (def name (expect-name))
   (expect :colon)
-  (def typ (expect-type))
-  @{:kind :var :name name :type typ})
+  # (def typ (expect-type))
+  (cond
+    (at? :num)
+    (let [len (expect-num)
+          _ (expect :kw-of)
+          typ (expect-type)]
+      @{:kind :array :name name :length len :type typ})
+    (let [typ (expect-type)]
+          @{:kind :var :name name :type typ})))
 
 (defn- parse-var-decl []
   (def v (parse-typed-name))
@@ -104,16 +111,21 @@
 (defn- parse-ident []
   @{:kind :ident :value (expect-name)})
 
+(var- parse-deref-or-ident nil)
+
 (defn parse-expr [&opt min-bp]
   (default min-bp 0)
   (var lhs
        (case (kind)
          :num        (let [t (next!)] @{:kind :num :value (t 1)})
-         :ident      (parse-ident)
+         :ident      (parse-deref-or-ident)
          :left-paren (do (next!)
                          (def e (parse-expr 0))
                          (expect :right-paren)
                          e)
+         :addrof (do (next!)
+                     (def what (parse-deref-or-ident))
+                     @{:kind :addrof :what what})
          (fail "expression")))
   (forever
     (def info (binary-ops (kind)))
@@ -123,9 +135,18 @@
     (set lhs @{:kind :binop :op (info :op) :lhs lhs :rhs rhs}))
   lhs)
 
+(set parse-deref-or-ident (fn []
+  (def id (parse-ident))
+  (if (at? :left-bracket)
+    (do (next!)
+        (def idx (parse-expr 0))
+        (expect :right-bracket)
+        @{:kind :deref-ident :what id :idx idx})
+    id)))
+
 (defn- parse-stmt-set []
   (expect :kw-set)
-  (def lvalue (parse-ident))
+  (def lvalue (parse-deref-or-ident))
   (expect :equals)
   (def rvalue (parse-expr))
   (expect :semicolon)
@@ -806,14 +827,14 @@
 
     proc stuff (ptr: address; idx: byte) returns (thing: byte) is
     begin
-        set thing = ptr[idx]; -- lda (ptr),idx
+        set thing = ptr[idx];
         return;
     end proc;
 begin
     set buffer_ptr = &buffer;
     set i = 3;
 
-    set buffer[i] = 69; -- lda buffer,i -- I think?
+    set buffer[i] = 69;
 
     call stuff (buffer_ptr, i) into (i);
 end program;
@@ -856,9 +877,9 @@ end program;
 (defn main [& args]
   (when (< (length args) 2)
     (errorf "Usage: %s src-path" (args 0)))
-  (def src (slurp (args 1)))
-  # (def program (annotate-program (parse-program (lex src))))
-  (def program (annotate-program ast))
+  # (def src (slurp (args 1)))
+  (def program (annotate-program (parse-program (lex source))))
+  # (def program (annotate-program ast))
   (each item (codegen-program (allocate-program program))
     (emit-item item)))
 
