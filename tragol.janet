@@ -426,6 +426,10 @@
   (each stmt (prog :body)  (annotate-stmt scope stmt))
   prog)
 
+# ------------- REGISTER ALLOCATION ------------- #
+
+(defn classify-program [prog] prog)
+
 # ------------- CALL GRAPH ------------- #
 
 (def main-node "<main>")
@@ -819,7 +823,22 @@
 
 # ------------- WORKFLOW ------------- #
 
-# this is the same as in `examples/basic.tgl`
+(defn main [& args]
+  (when (< (length args) 2)
+    (errorf "Usage: %s src-path" (args 0)))
+  (def src (slurp (args 1)))
+
+  (def program (parse-program (lex src)))
+  # (def program ast)
+
+  (def passed-around   # all info codegen could ever need
+    (allocate-program  # compute frames and allocate labels
+     (classify-program # assign registers, clobber tables, etc.
+      (annotate-program program)))) # typecheck, link declarations
+  (def ir (codegen-program passed-around))  # emit a flat internal representation
+  (each item ir (emit-item item)))  # emit 64tass 6502 assembly
+
+# kept for debugging purposes
 (def source `program addressing is
     buffer: 10 of byte;  -- buffer .fill 10
     i: byte;
@@ -873,48 +892,3 @@ end program;
                      :args @[@{:kind :ident :value "buffer_ptr"}
                              @{:kind :ident :value "i"}]
                      :into @[@{:kind :ident :value "i"}]}]})
-
-(defn main [& args]
-  (when (< (length args) 2)
-    (errorf "Usage: %s src-path" (args 0)))
-  # (def src (slurp (args 1)))
-  (def program (annotate-program (parse-program (lex source))))
-  # (def program (annotate-program ast))
-  (each item (codegen-program (allocate-program program))
-    (emit-item item)))
-
-# program main at $0800 is
-# result: byte at $f0;
-# proc test (A: byte; B: byte) returns (C: byte) at $1000 is
-# begin
-# set C = A + B;
-# return;
-# end proc;
-# begin
-# call test (34, 35) into (result);
-# return;
-# end program;
-# (def ast @{:kind :program
-#            :name "main"
-#            :at 0x800
-#            :globals @[@{:kind :var :name "result" :type :byte :at 0xf0}]
-#            :procs @[@{:kind :proc
-#                       :at 0x1000
-#                       :name "test"
-#                       :args @[@{:kind :var :name "A" :type :byte}
-#                               @{:kind :var :name "B" :type :byte}]
-#                       :locals @[]
-#                       :returns @[@{:kind :var :name "C" :type :byte}]
-#                       :body @[@{:kind :set
-#                                 :lvalue @{:kind :ident :value "C"}
-#                                 :rvalue @{:kind :binop
-#                                           :op :add
-#                                           :lhs @{:kind :ident :value "A"}
-#                                           :rhs @{:kind :ident :value "B"}}}
-#                               @{:kind :return}]}]
-#            :body @[@{:kind :call
-#                      :target @{:kind :ident :value "test"}
-#                      :args   @[@{:kind :num :value 34}
-#                                @{:kind :num :value 35}]
-#                      :into   @[@{:kind :ident :value "result"}]}
-#                    @{:kind :return}]})
